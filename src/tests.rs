@@ -192,6 +192,7 @@ fn test_game(hands: [&str; 3]) -> Game {
         last_play: None,
         passes: 0,
         winner: None,
+        peasant_played: false,
     }
 }
 
@@ -343,4 +344,38 @@ fn versions_match_up_to_minor() {
     assert!(!compatible(&format!("{major}.{minor}9.0")));
     assert!(!compatible(&format!("9{major}.{minor}.0")));
     assert!(!compatible("garbage"));
+}
+
+#[test]
+fn debug_cards_are_read_rank_then_suit() {
+    let card = |rank, suit| Some(Card::Standard { rank, suit });
+    assert_eq!(parse_card("10S"), card(Rank::Ten, Suit::Spades));
+    assert_eq!(parse_card("qh"), card(Rank::Queen, Suit::Hearts));
+    assert_eq!(parse_card("2D"), card(Rank::Two, Suit::Diamonds));
+    assert_eq!(parse_card("3C"), card(Rank::Three, Suit::Clubs));
+    assert_eq!(parse_card("BJ"), Some(Card::Joker(JokerColor::Black)));
+    assert_eq!(parse_card("rj"), Some(Card::Joker(JokerColor::Red)));
+    for bad in ["1S", "11S", "10", "S", "10X", "100S", "ZS", "♠S"] {
+        assert_eq!(parse_card(bad), None, "{bad}");
+    }
+}
+
+#[test]
+fn spring_is_only_when_no_peasant_played() {
+    // the landlord (seat 0) goes out while the peasants only pass
+    let mut game = test_game(["3 4", "5 6", "7 8"]);
+    game.play(0, &cards("3")).unwrap();
+    game.pass(1).unwrap();
+    game.pass(2).unwrap();
+    game.play(0, &cards("4")).unwrap();
+    assert!(game.spring());
+
+    // one peasant play is enough to spoil it
+    let mut game = test_game(["3 9", "5 6", "7 8"]);
+    game.play(0, &cards("3")).unwrap();
+    game.play(1, &cards("5")).unwrap();
+    game.pass(2).unwrap();
+    game.play(0, &cards("9")).unwrap();
+    assert_eq!(game.winner, Some(0));
+    assert!(!game.spring());
 }

@@ -16,9 +16,10 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::iter;
 use std::mem;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::str;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -48,18 +49,28 @@ const KITTY_SLIDE: Duration = Duration::from_millis(300);
 // two columns inside the border fit "10"; the suit goes on the line below the rank
 // how long a cleared table takes to sweep off the top of the screen
 const SWEEP: Duration = Duration::from_millis(300);
-// A nuke's mushroom cloud flashes, rises, holds and then thins away over
-// NUKE_CLOUD, revealing the jokers, which sit on the table for NUKE_REVEAL
-// before sweeping off like any cleared table. Times within the cloud, in
-// seconds from the blast:
-const NUKE_CLOUD: Duration = Duration::from_millis(2000);
+// A nuke's mushroom cloud flashes, rises, sends a ring rolling out along
+// the ground, then peels away over NUKE_CLOUD, revealing the jokers, which sit
+// on the table for NUKE_REVEAL before sweeping off like any cleared table.
+// Times within the cloud, in seconds from the blast:
+const NUKE_CLOUD: Duration = Duration::from_millis(4500);
 const NUKE_REVEAL: Duration = Duration::from_millis(1000);
 // the fireball, before the cloud starts to climb
 const NUKE_FLASH: f32 = 0.15;
 // how long the cap takes to reach full height
 const NUKE_RISE: f32 = 0.6;
-// when it starts thinning; the jokers show through from then on
-const NUKE_FADE_START: f32 = 1.2;
+// when it starts peeling; the jokers show through from then on
+const NUKE_FADE_START: f32 = 1.8;
+// the ring at the base: when it bursts out, how long it lasts, and how far
+// it rolls, in lines
+const NUKE_RING_START: f32 = 0.75;
+const NUKE_RING_LIFE: f32 = 1.8;
+const NUKE_RING_REACH: f32 = 22.0;
+// The ring is seen in perspective, from a viewer this many lines above the
+// ground and this far from the stem, so its near side sweeps down the screen
+// and past us while its far side flattens toward the horizon.
+const NUKE_EYE_HEIGHT: f32 = 4.0;
+const NUKE_EYE_DISTANCE: f32 = 30.0;
 // how tall the full cloud is, in lines, before it's shrunk to fit the screen
 const NUKE_HEIGHT: f32 = 17.0;
 // A bomb's blast flashes, bursts outward and then thins away over BOMB_BLAST,
@@ -214,12 +225,16 @@ impl fmt::Display for Rank {
 }
 
 impl Card {
-    // what's printed inside a face-up card: the rank, with the suit underneath
-    fn face(&self) -> String {
-        match self {
-            Card::Standard { rank, suit } => format!("{rank}\n{suit}"),
-            Card::Joker(JokerColor::Black) => "🃏\nB".to_string(),
-            Card::Joker(JokerColor::Red) => "🃏\nR".to_string(),
+    // What's printed inside a face-up card: the rank, with the suit
+    // underneath. Jokers are 大王 and 小王, the big and small kings, read top
+    // to bottom, unless gweilo mode has them as playing-card emoji.
+    fn face(&self, gweilo: bool) -> String {
+        match (self, gweilo) {
+            (Card::Standard { rank, suit }, _) => format!("{rank}\n{suit}"),
+            (Card::Joker(JokerColor::Red), false) => "大\n王".to_string(),
+            (Card::Joker(JokerColor::Black), false) => "小\n王".to_string(),
+            (Card::Joker(JokerColor::Red), true) => "🃏\nR".to_string(),
+            (Card::Joker(JokerColor::Black), true) => "🃏\nB".to_string(),
         }
     }
 
@@ -384,23 +399,30 @@ impl Combo {
         }
     }
 
-    // what the table shows under a combination
-    fn name(&self) -> String {
+    // What the table shows under a combination: its name from the combo
+    // sheet, in Chinese unless gweilo mode wants English, with its length if
+    // it's a sequence.
+    fn name(&self, gweilo: bool) -> String {
         use Combo::*;
-        match self {
-            Single(_) => "Single".to_string(),
-            Pair(_) => "Pair".to_string(),
-            ChainedPairs { pairs, .. } => format!("Chained pairs ({pairs})"),
-            Straight { len, .. } => format!("Straight ({len})"),
-            Triple(_) => "Three-of-a-kind".to_string(),
-            TripleWithSingle(_) => "Three-to-one".to_string(),
-            TripleWithPair(_) => "Three-to-two".to_string(),
-            Airplane { len, .. } => format!("Airplane ({len})"),
-            SmallWingedAirplane { len, .. } => format!("Small-winged airplane ({len})"),
-            LargeWingedAirplane { len, .. } => format!("Large-winged airplane ({len})"),
-            QuadWithPair(_) => "Quad-to-two".to_string(),
-            Bomb(_) => "Bomb".to_string(),
-            Nuke => "Nuke".to_string(),
+        let (entry, length) = match *self {
+            Single(_) => (0, None),
+            Pair(_) => (1, None),
+            ChainedPairs { pairs, .. } => (2, Some(pairs)),
+            Straight { len, .. } => (3, Some(len)),
+            Triple(_) => (4, None),
+            TripleWithSingle(_) => (5, None),
+            TripleWithPair(_) => (6, None),
+            Airplane { len, .. } => (7, Some(len)),
+            SmallWingedAirplane { len, .. } => (8, Some(len)),
+            LargeWingedAirplane { len, .. } => (9, Some(len)),
+            QuadWithPair(_) => (10, None),
+            Bomb(_) => (11, None),
+            Nuke => (12, None),
+        };
+        let name = COMBO_SHEET[entry].name(gweilo);
+        match length {
+            Some(n) => format!("{name} ({n})"),
+            None => name.to_string(),
         }
     }
 
@@ -554,6 +576,8 @@ enum MenuChoice {
     Host,
     Join,
     Settings,
+    // the hidden practice table that :debug opens
+    Playground,
 }
 
 // `notice` explains why the player was sent back here, e.g. the host ended the game.
@@ -563,16 +587,30 @@ fn run_menu(
     notice: Option<&str>,
 ) -> io::Result<Option<MenuChoice>> {
     let mut confirm_quit = false;
+    let mut command: Option<CommandLine> = None;
     loop {
         draw_themed(terminal, theme, |frame| {
             draw_menu(frame, notice);
             if confirm_quit {
                 draw_quit_prompt(frame, "Press [Esc] again to quit");
             }
+            if let Some(text) = &command {
+                draw_command_line(frame, &text.text);
+            }
         })?;
         if let Event::Key(key) = read_event()? {
             if key.kind != KeyEventKind::Press {
                 continue;
+            }
+            match command_key(&mut command, key.code) {
+                CommandInput::NotMine => {}
+                CommandInput::Typing => continue,
+                CommandInput::Entered(text) => {
+                    if matches!(parse_command(&text), Command::Debug) {
+                        return Ok(Some(MenuChoice::Playground));
+                    }
+                    continue;
+                }
             }
             if confirm_quit_key(&mut confirm_quit, key.code) {
                 return Ok(None);
@@ -587,31 +625,74 @@ fn run_menu(
     }
 }
 
+// 春天, shown when the landlord wins before either peasant has played, drawn
+// like the title but from the font at 16 pixels a character.
+const SPRING: [&str; 8] = [
+    "      ▄▄            ▄▄▄▄▄▄▄▄▄▄  ",
+    " ▀▀▀▀▀█▀▀▀▀▀▀       ▀▀▀▀██▀▀▀▀  ",
+    "  ▀▀▀██▀▀▀▀▀            ██      ",
+    " ██▄███▄▄▄▄██     ▀▀▀▀▀███▀▀▀▀▀▀",
+    " ▄▄██▄▄▄▄██▄▄▄         ██▀█     ",
+    "▀▀▀██▄▄▄▄▄█ ▀▀        ██  ▀█▄   ",
+    "   ██▄▄▄▄▄█       ▄▄██▀     ▀██ ",
+    "   ▀▀▀▀▀▀▀▀        ▀            ",
+];
+
+// 鬥地主 for the title, drawn from the STHeiti Medium font at 22 pixels a
+// character. Each cell is two pixels stacked, using half blocks, so the
+// pixels come out about square. Every line is the same width so the
+// characters stay lined up.
+const TITLE: [&str; 11] = [
+    "▄▄              ▄▄                  ▄▄                              ",
+    "████████ ██████▀██        ██        ██                   ▀██▄       ",
+    "██  ██     ██   ██        ██    ██  ██   ▄         ▄▄▄▄▄▄▄██▄▄▄▄▄▄▄ ",
+    "██▀▀██▀▀ ▀▀██▀▀ ██      ▄▄██▄▄  ██  ██▄███         ▀▀▀▀▀▀▀██▀▀▀▀▀▀▀ ",
+    "██ ▄██▄▄  ▄██ ▄ ██      ▀▀██▀▀▄▄██████▀ ██                ██        ",
+    "██▀▀▀▀▀▀ ▀▀▀▀▀▀ ██        ██  ▀▀██  ██  ██          ▄▄▄▄▄▄██▄▄▄▄▄▄  ",
+    "██              ██        ██    ██  ██ ▄██          ▀▀▀▀▀▀██▀▀▀▀▀▀  ",
+    "██              ██        ██ ▄▄ ██  ██ ▀▀▀                ██        ",
+    "██              ██      ▄▄███▀▀ ██  ▀▀   ▄█▄              ██        ",
+    "██            ███▀       ▀▀     ██▄▄▄▄▄▄▄██       ██████████████████",
+    "▀▀            ▀▀                 ▀▀▀▀▀▀▀                            ",
+];
+
 fn draw_menu(frame: &mut Frame, notice: Option<&str>) {
-    let area = frame
-        .area()
-        .centered(Constraint::Length(20), Constraint::Length(13));
-    if let Some(msg) = notice {
-        let full = frame.area();
-        frame.render_widget(
-            Paragraph::new(msg).alignment(Alignment::Center),
-            Rect::new(full.x, area.bottom() + 1, full.width, 1).intersection(full),
-        );
-    }
-    let [title, menu] =
-        Layout::vertical([Constraint::Length(2), Constraint::Length(11)]).areas(area);
+    let full = frame.area();
+    // the title, a gap, three buttons, and a line for any notice: 24 lines,
+    // which is the smallest the screen gets
+    let title_height = TITLE.len() as u16;
+    let column = full.centered_vertically(Constraint::Length(title_height + 13));
+    let [title, _, menu, notice_line] = Layout::vertical([
+        Constraint::Length(title_height),
+        Constraint::Length(1),
+        Constraint::Length(11),
+        Constraint::Length(1),
+    ])
+    .areas(column);
+
+    let title_width = TITLE[0].chars().count() as u16;
+    let title_x = full.x + full.width.saturating_sub(title_width) / 2;
+    draw_art(frame, &TITLE, title_x as i32, title.y as i32);
+
     let buttons: [Rect; 3] = Layout::vertical([Constraint::Length(3); 3])
         .spacing(1)
-        .areas(menu);
-
-    frame.render_widget(Paragraph::new("鬥地主").alignment(Alignment::Center), title);
-
+        .areas(menu.centered_horizontally(Constraint::Length(20)));
     for (label, rect) in ["[h]ost", "[j]oin", "[s]ettings"].into_iter().zip(buttons) {
         let button = Paragraph::new(label)
             .alignment(Alignment::Center)
             .block(Block::bordered());
         frame.render_widget(button, rect);
     }
+
+    if let Some(msg) = notice {
+        frame.render_widget(Paragraph::new(msg).alignment(Alignment::Center), notice_line);
+    }
+
+    // bottom-left, clear of the quit prompt in the bottom-right corner
+    frame.render_widget(
+        Paragraph::new(format!("v{VERSION}")),
+        Rect::new(full.x + 1, full.bottom().saturating_sub(1), full.width, 1).intersection(full),
+    );
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -748,6 +829,8 @@ enum Message {
     GameOver {
         winner: usize,
         wins: Option<Vec<u32>>,
+        // the landlord went out before either peasant played a card
+        spring: bool,
     },
     // joiner -> host: whether this player wants to play again
     Vote {
@@ -756,6 +839,12 @@ enum Message {
     // host -> players: how many have said they'll play again
     Ready {
         count: usize,
+    },
+    // joiner -> host: a winner pressed G on the game-over screen
+    Gloat,
+    // host -> players: `seat` gloated
+    Gloated {
+        seat: usize,
     },
     // host -> players: `seat` said no to playing again, or left, so the lobby
     // is closing
@@ -856,7 +945,6 @@ fn hello_name(messages: Vec<Message>) -> Option<String> {
 // when someone leaves.
 struct Beacon {
     name: String,
-    ip: Option<IpAddr>,
     port: u16,
     listener: TcpListener,
     broadcaster: UdpSocket,
@@ -872,7 +960,6 @@ impl Beacon {
         broadcaster.set_broadcast(true)?;
         Ok(Beacon {
             name: name.to_string(),
-            ip: lan_ip(),
             port: listener.local_addr()?.port(),
             listener,
             broadcaster,
@@ -1121,14 +1208,6 @@ impl HostLobby {
     }
 }
 
-// Connecting a UDP socket sends no packets; it only makes the OS choose the
-// interface it would route through, whose address is our LAN IP.
-fn lan_ip() -> Option<IpAddr> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("8.8.8.8", 80)).ok()?;
-    Some(socket.local_addr().ok()?.ip())
-}
-
 // Returns a message for the home screen, if there's something to tell the player.
 fn run_host(terminal: &mut DefaultTerminal, settings: &Settings) -> io::Result<Option<String>> {
     let mut lobby = HostLobby::new(&settings.player_name)?;
@@ -1316,12 +1395,15 @@ impl HostTable {
                 }
             }
             let wins = self.shown_wins();
+            let spring = self.game.spring();
             self.send_all(&Message::GameOver {
                 winner,
                 wins: wins.clone(),
+                spring,
             });
             self.view.winner = Some(winner);
             self.view.wins = wins;
+            self.view.spring = spring;
         }
         Ok(text)
     }
@@ -1344,6 +1426,15 @@ impl HostTable {
             Vec::new()
         };
         self.make_move(seat, cards, true).ok()?
+    }
+
+    // Passes a winner's gloat on to everyone. Losers can't gloat.
+    fn gloat(&mut self, seat: usize) {
+        if !self.view.is_winner(seat) {
+            return;
+        }
+        self.send_all(&Message::Gloated { seat });
+        self.view.gloats[seat] = Some(Instant::now());
     }
 
     fn vote(&mut self, seat: usize, again: bool) -> VoteOutcome {
@@ -1503,7 +1594,7 @@ fn run_host_game(
             match msg {
                 Message::Claim => {
                     if table.crown(seat) {
-                        notice = Some(Notice::new(crown_notice(&table.view, seat)));
+                        notice = Some(Notice::new(crown_notice(&table.view, seat, theme.gweilo)));
                     }
                 }
                 Message::Play { cards } => match table.make_move(seat, cards, false) {
@@ -1519,6 +1610,7 @@ fn run_host_game(
                         },
                     ),
                 },
+                Message::Gloat => table.gloat(seat),
                 Message::Vote { again } => match table.vote(seat, again) {
                     VoteOutcome::Waiting => {}
                     VoteOutcome::Restart => {
@@ -1537,7 +1629,7 @@ fn run_host_game(
         if table.rules.random_landlord && table.view.phase() == Phase::Bidding {
             let seat = rand::rng().random_range(0..NUM_PLAYERS as usize);
             if table.crown(seat) {
-                notice = Some(Notice::new(crown_notice(&table.view, seat)));
+                notice = Some(Notice::new(crown_notice(&table.view, seat, theme.gweilo)));
             }
         }
         match table.view.vacant {
@@ -1557,7 +1649,7 @@ fn run_host_game(
             Some(GameAction::Leave) => return Ok(None),
             Some(GameAction::Claim) => {
                 if table.crown(table.view.seat) {
-                    notice = Some(Notice::new(crown_notice(&table.view, table.view.seat)));
+                    notice = Some(Notice::new(crown_notice(&table.view, table.view.seat, theme.gweilo)));
                 }
             }
             Some(GameAction::Submit(cards)) => match table.make_move(table.view.seat, cards, false) {
@@ -1568,6 +1660,8 @@ fn run_host_game(
                 }
                 Err(e) => table.view.reject(e.to_string()),
             },
+            Some(GameAction::Say(text)) => notice = Some(Notice::new(text)),
+            Some(GameAction::Gloat) => table.gloat(table.view.seat),
             Some(GameAction::Vote(again)) => match table.vote(table.view.seat, again) {
                 VoteOutcome::Waiting => {}
                 VoteOutcome::Restart => {
@@ -1614,12 +1708,10 @@ fn draw_host(frame: &mut Frame, lobby: &HostLobby, hints: bool) {
     let options_height = LobbySettings::ROWS.len() as u16 + 2;
     let area = frame.area().centered(
         Constraint::Length(30),
-        Constraint::Length(4 + list_height + options_height),
+        Constraint::Length(list_height + options_height + 1),
     );
     // the start line is always reserved so the panels don't shift when it appears
-    let [info, _, players, options, start] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(1),
+    let [players, options, start] = Layout::vertical([
         Constraint::Length(list_height),
         Constraint::Length(options_height),
         Constraint::Length(1),
@@ -1628,15 +1720,6 @@ fn draw_host(frame: &mut Frame, lobby: &HostLobby, hints: bool) {
     frame.render_widget(
         Paragraph::new(lobby.settings.summary()).block(Block::bordered().title(" [s]ettings ")),
         options,
-    );
-
-    let ip = lobby
-        .beacon
-        .ip
-        .map_or("unknown".to_string(), |ip| ip.to_string());
-    frame.render_widget(
-        Paragraph::new(format!("IP:   {ip}\nPort: {}", lobby.beacon.port)),
-        info,
     );
 
     let mut names = lobby.player_names();
@@ -2032,7 +2115,7 @@ fn run_joined_game(
                 }
                 Message::Landlord { seat, kitty } => {
                     view.crown(seat, kitty, true);
-                    notice = Some(Notice::new(crown_notice(&view, seat)));
+                    notice = Some(Notice::new(crown_notice(&view, seat, theme.gweilo)));
                 }
                 Message::Moved {
                     seat,
@@ -2046,11 +2129,17 @@ fn run_joined_game(
                     }
                 }
                 Message::Rejected { reason } => view.reject(reason),
-                Message::GameOver { winner, wins } => {
+                Message::GameOver {
+                    winner,
+                    wins,
+                    spring,
+                } => {
                     view.winner = Some(winner);
                     view.wins = wins;
+                    view.spring = spring;
                 }
                 Message::Ready { count } => view.ready = count,
+                Message::Gloated { seat } => view.gloats[seat] = Some(Instant::now()),
                 Message::Disbanded { seat, left } => {
                     return Ok(Leave::ToMenu(Some(disband_text(&view, seat, left))));
                 }
@@ -2082,6 +2171,10 @@ fn run_joined_game(
             Some(GameAction::Vote(again)) => {
                 let _ = conn.send(&Message::Vote { again });
             }
+            Some(GameAction::Say(text)) => notice = Some(Notice::new(text)),
+            Some(GameAction::Gloat) => {
+                let _ = conn.send(&Message::Gloat);
+            }
             None => {}
         }
     }
@@ -2102,6 +2195,8 @@ struct Game {
     passes: u8,
     // whoever shed their whole hand first
     winner: Option<usize>,
+    // set once a peasant plays any cards; passes don't count
+    peasant_played: bool,
 }
 
 // Why a play or pass was refused.
@@ -2154,6 +2249,7 @@ impl Game {
             last_play: None,
             passes: 0,
             winner: None,
+            peasant_played: false,
         }
     }
 
@@ -2184,6 +2280,9 @@ impl Game {
             });
             self.turn = next_seat(seat);
         }
+        if self.landlord != Some(seat) {
+            self.peasant_played = true;
+        }
         if self.hands[seat].cards.is_empty() {
             self.winner = Some(seat);
         }
@@ -2191,6 +2290,11 @@ impl Game {
     }
 
     // how many cards each seat has played so far
+    // 春天: the landlord won without either peasant playing a card
+    fn spring(&self) -> bool {
+        self.winner.is_some() && self.winner == self.landlord && !self.peasant_played
+    }
+
     fn played(&self) -> Vec<usize> {
         (0..NUM_PLAYERS as usize)
             .map(|seat| {
@@ -2268,6 +2372,8 @@ struct GameView {
     flown: Option<Instant>,
     // whoever shed their whole hand, once someone has
     winner: Option<usize>,
+    // whether it was a 春天, which the game-over screen celebrates
+    spring: bool,
     // our answer to playing again, and how many have said yes so far
     voted: Option<bool>,
     ready: usize,
@@ -2282,6 +2388,39 @@ struct GameView {
     silly_effects: bool,
     // each seat's wins this session, once there's been a rematch
     wins: Option<Vec<u32>>,
+    // Some while the combo sheet is open
+    sheet: Option<ComboSheet>,
+    // Some while a hidden : command is being typed
+    command: Option<CommandLine>,
+    // when each seat last gloated, after winning
+    gloats: Vec<Option<Instant>>,
+}
+
+struct ComboSheet {
+    // which combination the cursor is on
+    selected: usize,
+    // whether its description is open
+    open: bool,
+}
+
+impl ComboSheet {
+    // Handles a key. Returns false once the sheet has been closed.
+    fn key(&mut self, code: KeyCode) -> bool {
+        let n = COMBO_SHEET.len();
+        match code {
+            KeyCode::Esc if self.open => self.open = false,
+            KeyCode::Esc | KeyCode::Char('c' | 'C') => return false,
+            KeyCode::Up | KeyCode::Char('k') if !self.open => {
+                self.selected = (self.selected + n - 1) % n;
+            }
+            KeyCode::Down | KeyCode::Char('j') if !self.open => {
+                self.selected = (self.selected + 1) % n;
+            }
+            KeyCode::Enter => self.open = true,
+            _ => {}
+        }
+        true
+    }
 }
 
 struct Crowning {
@@ -2355,6 +2494,7 @@ impl GameView {
             bombed: None,
             flown: None,
             winner: None,
+            spring: false,
             voted: None,
             ready: 0,
             move_timer: rules.move_timer.map(Duration::from_secs),
@@ -2362,6 +2502,9 @@ impl GameView {
             random_landlord: rules.random_landlord,
             silly_effects: rules.silly_effects,
             wins: None,
+            sheet: None,
+            command: None,
+            gloats: vec![None; NUM_PLAYERS as usize],
         }
     }
 
@@ -2485,6 +2628,26 @@ impl GameView {
         (t < 1.0).then_some(t)
     }
 
+    // Starts an effect on this screen only, for the playground.
+    fn debug_anim(&mut self, anim: DebugAnim) {
+        let now = Instant::now();
+        match anim {
+            DebugAnim::Airplane => self.flown = Some(now),
+            DebugAnim::Bomb => self.bombed = Some(now),
+            DebugAnim::Nuke => {
+                self.swept = Some(Swept {
+                    play: Play {
+                        seat: self.seat,
+                        cards: vec![Card::Joker(JokerColor::Black), Card::Joker(JokerColor::Red)],
+                        combo: Combo::Nuke,
+                    },
+                    at: now,
+                    nuke: true,
+                });
+            }
+        }
+    }
+
     // whether the cloud is still thick enough to hide the table
     fn cloud_covers_table(&self) -> bool {
         self.cloud()
@@ -2553,19 +2716,49 @@ impl GameView {
 
     // The headline for the end of the game, and whether we're on the winning
     // side. A landlord wins alone; if a peasant goes out, both peasants win.
-    fn result(&self) -> Option<(String, bool)> {
+    // We're "You", first, so the headline alone says whether we won.
+    fn result(&self, gweilo: bool) -> Option<(String, bool)> {
         let winner = self.winner?;
         let landlord_won = self.is_landlord(winner);
-        let headline = if landlord_won {
-            format!("{} (地主) wins!", self.names[winner])
-        } else {
-            let peasants: Vec<&str> = (0..NUM_PLAYERS as usize)
-                .filter(|&seat| !self.is_landlord(seat))
-                .map(|seat| self.names[seat].as_str())
-                .collect();
-            format!("{} (農民) win!", peasants.join(" and "))
-        };
-        Some((headline, self.is_landlord(self.seat) == landlord_won))
+        let mut winners: Vec<usize> = (0..NUM_PLAYERS as usize)
+            .filter(|&seat| self.is_landlord(seat) == landlord_won)
+            .collect();
+        winners.sort_by_key(|&seat| seat != self.seat);
+        let names: Vec<&str> = winners
+            .iter()
+            .map(|&seat| {
+                if seat == self.seat {
+                    "You"
+                } else {
+                    self.names[seat].as_str()
+                }
+            })
+            .collect();
+        let won = winners.contains(&self.seat);
+        // "wins" for one other player, "win" for us or for two
+        let verb = if names.len() == 1 && !won { "wins" } else { "win" };
+        let headline = format!(
+            "{} ({}) {verb}!",
+            names.join(" and "),
+            role_name(landlord_won, gweilo)
+        );
+        Some((headline, won))
+    }
+
+    // whether `seat` is on the winning side, once someone has won
+    fn is_winner(&self, seat: usize) -> bool {
+        self.winner
+            .is_some_and(|winner| self.is_landlord(seat) == self.is_landlord(winner))
+    }
+
+    // the seats whose gloats are still showing, each for GLOAT_DURATION
+    // after their latest
+    fn gloating(&self) -> Vec<usize> {
+        (0..NUM_PLAYERS as usize)
+            .filter(|&seat| {
+                self.gloats[seat].is_some_and(|at| at.elapsed() < GLOAT_DURATION)
+            })
+            .collect()
     }
 
     fn is_landlord(&self, seat: usize) -> bool {
@@ -2711,11 +2904,23 @@ fn disband_text(view: &GameView, seat: usize, left: bool) -> String {
     }
 }
 
-fn crown_notice(view: &GameView, seat: usize) -> String {
+// what the landlord and the peasants are called, in Chinese unless gweilo
+// mode wants English
+fn role_name(landlord: bool, gweilo: bool) -> &'static str {
+    match (landlord, gweilo) {
+        (true, false) => "地主",
+        (false, false) => "農民",
+        (true, true) => "Landlord",
+        (false, true) => "Peasant",
+    }
+}
+
+fn crown_notice(view: &GameView, seat: usize, gweilo: bool) -> String {
+    let landlord = role_name(true, gweilo);
     if seat == view.seat {
-        "You are the 地主".to_string()
+        format!("You are the {landlord}")
     } else {
-        format!("{} is the 地主", view.names[seat])
+        format!("{} is the {landlord}", view.names[seat])
     }
 }
 
@@ -2747,6 +2952,107 @@ fn lerp(a: u16, b: u16, t: f32) -> u16 {
 // the move timer's lengths, in seconds
 const TIMER_CHOICES: [Option<u64>; 5] = [None, Some(30), Some(60), Some(90), Some(120)];
 
+// One combination on the combo sheet.
+struct SheetEntry {
+    english: &'static str,
+    chinese: &'static str,
+    // what it is and what can follow it, always in English
+    description: &'static str,
+    example: &'static str,
+}
+
+impl SheetEntry {
+    // in Chinese unless gweilo mode wants English
+    fn name(&self, gweilo: bool) -> &'static str {
+        if gweilo { self.english } else { self.chinese }
+    }
+}
+
+// The combo sheet, in the order Combo::name refers to.
+const COMBO_SHEET: [SheetEntry; 13] = [
+    SheetEntry {
+        english: "Single",
+        chinese: "單張",
+        description: "Any one card. Ranks run 3 up to A, then 2, then the black joker, then the red joker.",
+        example: "A",
+    },
+    SheetEntry {
+        english: "Pair",
+        chinese: "對子",
+        description: "Two cards of the same rank. The two jokers aren't a pair: together they're the Nuke.",
+        example: "3 3",
+    },
+    SheetEntry {
+        english: "Chained pairs",
+        chinese: "連對",
+        description: "Three or more pairs of consecutive ranks, with no 2s or jokers. A reply needs the same number of pairs.",
+        example: "7 7 8 8 9 9",
+    },
+    SheetEntry {
+        english: "Straight",
+        chinese: "順子",
+        description: "Five or more single cards of consecutive ranks, up to A, with no 2s or jokers. A reply needs the same length.",
+        example: "5 6 7 8 9 10 J",
+    },
+    SheetEntry {
+        english: "Three-of-a-kind",
+        chinese: "三張",
+        description: "Three cards of the same rank.",
+        example: "9 9 9",
+    },
+    SheetEntry {
+        english: "Three-to-one",
+        chinese: "三帶一",
+        description: "Three of a kind plus one kicker of any other rank, which can be a single joker. The triple decides its strength.",
+        example: "9 9 9 4",
+    },
+    SheetEntry {
+        english: "Three-to-two",
+        chinese: "三帶二",
+        description: "Three of a kind plus a pair of any other rank. The triple decides its strength.",
+        example: "9 9 9 4 4",
+    },
+    SheetEntry {
+        english: "Airplane",
+        chinese: "飛機",
+        description: "Two or more three-of-a-kinds of consecutive ranks, with no 2s. A reply needs the same number of triples.",
+        example: "3 3 3 4 4 4",
+    },
+    SheetEntry {
+        english: "Small-winged airplane",
+        chinese: "飛機帶單",
+        description: "An airplane plus one single kicker per triple. Kickers can be any rank but the airplane's own, with at most one joker.",
+        example: "3 3 3 4 4 4 7 9",
+    },
+    SheetEntry {
+        english: "Large-winged airplane",
+        chinese: "飛機帶對",
+        description: "An airplane plus one pair per triple. The pairs must be different ranks from each other and from the airplane, and can't be jokers.",
+        example: "3 3 3 4 4 4 7 7 9 9",
+    },
+    SheetEntry {
+        english: "Quad-to-two",
+        chinese: "四帶二",
+        description: "Four of a kind plus a pair. Unlike a bomb, it only beats a lower quad-to-two.",
+        example: "6 6 6 6 8 8",
+    },
+    SheetEntry {
+        english: "Bomb",
+        chinese: "炸彈",
+        description: "Four of a kind. It beats anything except a higher bomb or the Nuke, and afterwards only those can follow it.",
+        example: "6 6 6 6",
+    },
+    SheetEntry {
+        english: "Nuke",
+        chinese: "王炸",
+        description: "Both jokers. Nothing beats it: the table clears and the turn comes straight back to you.",
+        example: "BJ RJ",
+    },
+];
+
+// how long "<name> gloated" stays up; gloating again starts it over
+const GLOAT_DURATION: Duration = Duration::from_secs(2);
+
 const NOTICE_DURATION: Duration = Duration::from_secs(4);
 
 // A message shown at the top of the game screen for a few seconds.
@@ -2776,6 +3082,10 @@ enum GameAction {
     Submit(Vec<Card>),
     // the player's answer to playing again
     Vote(bool),
+    // something to show at the top of the screen, like a command's reply
+    Say(String),
+    // a winner pressed G on the game-over screen
+    Gloat,
 }
 
 // Draws one frame of the game and handles a key if one arrives.
@@ -2787,9 +3097,13 @@ fn game_frame(
     confirm_quit: &mut bool,
 ) -> io::Result<Option<GameAction>> {
     draw_themed(terminal, theme, |frame| {
-        draw_game(frame, view, notice.and_then(Notice::current), theme.hints);
+        draw_game(frame, view, notice.and_then(Notice::current), theme);
+        draw_sheet_or_hint(frame, view, theme);
         if *confirm_quit {
             draw_quit_prompt(frame, "Press [Esc] again to leave the game");
+        }
+        if let Some(text) = &view.command {
+            draw_command_line(frame, &text.text);
         }
     })?;
     // redraw at frame rate only while cards are moving
@@ -2807,8 +3121,30 @@ fn game_frame(
     if key.kind != KeyEventKind::Press {
         return Ok(None);
     }
+    // Debug commands stay out of real games, so what everyone sees matches;
+    // :debug just says where to find them.
+    match command_key(&mut view.command, key.code) {
+        CommandInput::NotMine => {}
+        CommandInput::Typing => return Ok(None),
+        CommandInput::Entered(text) => {
+            return Ok(match parse_command(&text) {
+                Command::Debug => {
+                    Some(GameAction::Say("Leave the game to use debug mode".to_string()))
+                }
+                _ => None,
+            });
+        }
+    }
+    // while the combo sheet is open, keys are for it; the game carries on
+    if view.sheet.is_some() {
+        sheet_key(view, key.code);
+        return Ok(None);
+    }
     if confirm_quit_key(confirm_quit, key.code) {
         return Ok(Some(GameAction::Leave));
+    }
+    if sheet_key(view, key.code) {
+        return Ok(None);
     }
     // while the game is on hold, nothing else responds
     if view.vacant.is_some() {
@@ -2847,6 +3183,12 @@ fn game_frame(
             }
         }
         Phase::Playing if key.code == KeyCode::Backspace => view.selected.clear(),
+        // winners can gloat as often as they like, voted or not
+        Phase::Over
+            if matches!(key.code, KeyCode::Char('g' | 'G')) && view.is_winner(view.seat) =>
+        {
+            return Ok(Some(GameAction::Gloat));
+        }
         Phase::Over if view.voted.is_none() => {
             let again = match key.code {
                 KeyCode::Char('y' | 'Y') => true,
@@ -2863,7 +3205,8 @@ fn game_frame(
     Ok(None)
 }
 
-fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bool) {
+fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, theme: Theme) {
+    let Theme { hints, gweilo, .. } = theme;
     let area = frame.area();
     let elapsed = view.deal_start.elapsed();
     let launched = cards_launched(elapsed);
@@ -2917,7 +3260,8 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
     // the deck until every card has left it, then the kitty face down until
     // there's a landlord
     if launched < DEAL_COUNT {
-        let deck = Rect::new(cx.saturating_sub(3), cy.saturating_sub(2), 7, 5);
+        // card-sized, where the dealt cards leave from
+        let deck = card_rect(cx.saturating_sub(CARD_WIDTH / 2), cy.saturating_sub(1));
         draw_card_back(frame, deck);
     } else if view.landlord.is_none() {
         for i in 0..KITTY_SIZE as usize {
@@ -2926,10 +3270,11 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
     }
 
     if phase == Phase::Bidding && view.vacant.is_none() && !view.random_landlord {
-        let prompt = if view.claimed {
-            "叫地主!"
-        } else {
-            "Press [Space] to 叫地主"
+        let prompt = match (view.claimed, gweilo) {
+            (true, false) => "叫地主!",
+            (false, false) => "Press [Space] to 叫地主",
+            (true, true) => "Called!",
+            (false, true) => "Press [Space] to call Landlord",
         };
         frame.render_widget(
             Paragraph::new(prompt).alignment(Alignment::Center),
@@ -2938,8 +3283,7 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
     }
 
     let role = |seat: usize| match phase {
-        Phase::Playing | Phase::Over if view.is_landlord(seat) => "地主",
-        Phase::Playing | Phase::Over => "農民",
+        Phase::Playing | Phase::Over => role_name(view.is_landlord(seat), gweilo),
         _ => "",
     };
     // a player's role and session wins, whichever there are yet
@@ -3001,7 +3345,7 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
             && !view.blast_covers_table()
             && !plane_x.is_some_and(|x| x + 1 > cx as i32)
         {
-            draw_play(frame, view, play, kitty_y);
+            draw_play(frame, view, play, kitty_y, gweilo);
         }
 
         if view.turn == view.seat && view.vacant.is_none() {
@@ -3033,9 +3377,9 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
     );
     // our cards appear in sorted order as they land; the cursor waits for play
     let cursor_in = |row: HandRow| (phase == Phase::Playing && view.row == row).then_some(view.cursor);
-    draw_hand(frame, &main, hand_y, &view.selected, cursor_in(HandRow::Main));
+    draw_hand(frame, &main, hand_y, &view.selected, cursor_in(HandRow::Main), gweilo);
     if !split.is_empty() {
-        draw_hand(frame, &split, split_y, &view.selected, cursor_in(HandRow::Split));
+        draw_hand(frame, &split, split_y, &view.selected, cursor_in(HandRow::Split), gweilo);
     }
     if phase == Phase::Playing && hints {
         let hint = if split.is_empty() {
@@ -3069,7 +3413,7 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
         let distance = (kitty_y + CARD_HEIGHT + 1) as f32;
         let rise = (distance * t * t).round() as u16;
         if rise <= kitty_y {
-            draw_play(frame, view, play, kitty_y - rise);
+            draw_play(frame, view, play, kitty_y - rise, gweilo);
         }
     }
     if let Some(since) = view.cloud() {
@@ -3100,20 +3444,31 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
         let target = destination(crowning.seat);
         for (i, &card) in crowning.kitty.iter().enumerate() {
             let rect = card_rect(lerp(kitty_x(i), target.0, t), lerp(kitty_y, target.1, t));
-            draw_card_face(frame, rect, card);
+            draw_card_face(frame, rect, card, gweilo);
         }
     }
 
-    if let Some((headline, won)) = view.result() {
-        let rect = area.centered(Constraint::Length(46), Constraint::Length(8));
+    if let Some((headline, won)) = view.result(gweilo) {
+        // a 春天 gets its characters above the box, the pair centred together
+        let art_height = if view.spring { SPRING.len() as u16 + 1 } else { 0 };
+        let column = area.centered(Constraint::Length(46), Constraint::Length(art_height + 8));
+        let rect = Rect::new(column.x, column.y + art_height, column.width, 8);
+        if view.spring {
+            let width = SPRING[0].chars().count() as u16;
+            let x = area.x + area.width.saturating_sub(width) / 2;
+            clear_rect(frame, Rect::new(x, column.y, width, SPRING.len() as u16));
+            draw_art(frame, &SPRING, x as i32, column.y as i32);
+        }
         clear_rect(frame, rect);
-        let outcome = if won { "You win!" } else { "You lose" };
         let question = match view.voted {
             None => "Play again? [Y] yes · [N] no",
             Some(_) => "Waiting for the others...",
         };
+        // Gloating is a sideshow, so it goes last. Winners can always gloat,
+        // so the line stays as long as hints do.
+        let gloat = if hints && won { "[G] gloat" } else { "" };
         let text = format!(
-            "{headline}\n{outcome}\n\n{question}\n{}/{NUM_PLAYERS} ready",
+            "{headline}\n\n{question}\n{}/{NUM_PLAYERS} ready\n\n{gloat}",
             view.ready
         );
         frame.render_widget(
@@ -3122,6 +3477,18 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
                 .block(Block::bordered().title(" Game over ")),
             rect,
         );
+        // one line per gloating winner under the box, so both peasants show
+        for (i, seat) in view.gloating().into_iter().enumerate() {
+            let who = if seat == view.seat {
+                "You".to_string()
+            } else {
+                view.names[seat].clone()
+            };
+            frame.render_widget(
+                Paragraph::new(format!("{who} gloated")).alignment(Alignment::Center),
+                Rect::new(area.x, rect.bottom() + i as u16, area.width, 1).intersection(area),
+            );
+        }
     }
 
     if let Some(seat) = view.vacant {
@@ -3140,9 +3507,90 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, hints: bo
     }
 }
 
+// The combo sheet over the table while it's open, or else the corner hint
+// for opening it.
+fn draw_sheet_or_hint(frame: &mut Frame, view: &GameView, theme: Theme) {
+    if let Some(sheet) = &view.sheet {
+        draw_combo_sheet(frame, sheet, theme.hints, theme.gweilo);
+    } else if theme.hints {
+        let area = frame.area();
+        frame.render_widget(
+            Paragraph::new("[C] combos").alignment(Alignment::Right),
+            Rect::new(area.x, area.y, area.width.saturating_sub(1), 1),
+        );
+    }
+}
+
+// Gives a key to the combo sheet: C opens it, and while it's open it takes
+// every key. Returns whether the sheet took the key.
+fn sheet_key(view: &mut GameView, code: KeyCode) -> bool {
+    match &mut view.sheet {
+        Some(sheet) => {
+            if !sheet.key(code) {
+                view.sheet = None;
+            }
+            true
+        }
+        None if matches!(code, KeyCode::Char('c' | 'C')) => {
+            view.sheet = Some(ComboSheet {
+                selected: 0,
+                open: false,
+            });
+            true
+        }
+        None => false,
+    }
+}
+
+// The list of combinations over the table, and the selected one's details
+// in a box on top once it's opened.
+fn draw_combo_sheet(frame: &mut Frame, sheet: &ComboSheet, hints: bool, gweilo: bool) {
+    let area = frame.area();
+    let list_height = COMBO_SHEET.len() as u16 + 2;
+    let rect = area.centered(Constraint::Length(30), Constraint::Length(list_height + 1));
+    let [list, hint] =
+        Layout::vertical([Constraint::Length(list_height), Constraint::Length(1)]).areas(rect);
+    clear_rect(frame, rect);
+    let lines: Vec<String> = COMBO_SHEET
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let cursor = if i == sheet.selected { ">" } else { " " };
+            format!("{cursor} {}", entry.name(gweilo))
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines.join("\n")).block(Block::bordered().title(" Combos ")),
+        list,
+    );
+    if hints {
+        let text = if sheet.open {
+            "[Esc] back"
+        } else {
+            "[↑/↓] select · [Enter] open · [Esc] close"
+        };
+        frame.render_widget(
+            Paragraph::new(text).alignment(Alignment::Center),
+            Rect::new(area.x, hint.y, area.width, 1),
+        );
+    }
+
+    if sheet.open {
+        let entry = &COMBO_SHEET[sheet.selected];
+        let rect = area.centered(Constraint::Length(48), Constraint::Length(8));
+        clear_rect(frame, rect);
+        frame.render_widget(
+            Paragraph::new(format!("{}\n\ne.g. {}", entry.description, entry.example))
+                .wrap(Wrap { trim: true })
+                .block(Block::bordered().title(format!(" {} ", entry.name(gweilo)))),
+            rect,
+        );
+    }
+}
+
 // A play on the table: its cards with whoever played them above and the kind
 // of combination below.
-fn draw_play(frame: &mut Frame, view: &GameView, play: &Play, y: u16) {
+fn draw_play(frame: &mut Frame, view: &GameView, play: &Play, y: u16, gweilo: bool) {
     let area = frame.area();
     let mut cards = play.cards.clone();
     cards.sort();
@@ -3152,9 +3600,9 @@ fn draw_play(frame: &mut Frame, view: &GameView, play: &Play, y: u16) {
             Rect::new(area.x, y - 1, area.width, 1).intersection(area),
         );
     }
-    draw_hand(frame, &cards, y, &BTreeSet::new(), None);
+    draw_hand(frame, &cards, y, &BTreeSet::new(), None, gweilo);
     frame.render_widget(
-        Paragraph::new(play.combo.name()).alignment(Alignment::Center),
+        Paragraph::new(play.combo.name(gweilo)).alignment(Alignment::Center),
         Rect::new(area.x, y + CARD_HEIGHT, area.width, 1).intersection(area),
     );
 }
@@ -3179,13 +3627,23 @@ fn smoke(ux: f32, uy: f32, secs: f32) -> f32 {
     // the stem, tapering toward the cap
     let stem = if (0.0..=height).contains(&uy) {
         let half_width = 0.9 + 0.6 * (1.0 - uy / height);
-        0.8 * (1.0 - ux.abs() / half_width)
+        // as thick as the cap, so the column is the last thing left
+        1.0 - ux.abs() / half_width
     } else {
         0.0
     };
-    // dust rolling out along the ground
-    let (skirt_x, skirt_y) = (ux / (1.5 + 7.0 * p), uy / 1.3);
-    let skirt = 0.7 * (1.0 - (skirt_x * skirt_x + skirt_y * skirt_y).sqrt());
+    // Dust rolling out along the ground. Below the ground line it's a disc
+    // lying on the ground, seen in perspective like the base ring, so its
+    // near edge curves down toward us and the base doesn't look cut flat.
+    let spread = 1.5 + 7.0 * p;
+    let skirt = if uy >= 0.0 {
+        let (x, y) = (ux / spread, uy / 1.3);
+        0.7 * (1.0 - (x * x + y * y).sqrt())
+    } else {
+        let nearness = 1.0 - uy / NUKE_EYE_HEIGHT;
+        let (x, z) = (ux / nearness, NUKE_EYE_DISTANCE - NUKE_EYE_DISTANCE / nearness);
+        0.7 * (1.0 - (x * x + z * z).sqrt() / spread)
+    };
     let body = cap.max(stem).max(skirt);
     if body <= 0.0 {
         return 0.0;
@@ -3231,19 +3689,56 @@ fn fade_progress(secs: f32, fade_start: f32, total: Duration) -> f32 {
     ((secs - fade_start) / (total.as_secs_f32() - fade_start)).clamp(0.0, 1.0)
 }
 
+// The nuke's base ring, 0 to 1, at screen point `ux` across and `uy` up
+// from the foot of the stem: a ring on the ground rolling outward and
+// thinning as it goes, seen in perspective. Each screen point is traced back
+// to the point on the ground it would show; rows above the horizon show none.
+fn nuke_ring(ux: f32, uy: f32, secs: f32) -> f32 {
+    let t = (secs - NUKE_RING_START) / NUKE_RING_LIFE;
+    if !(0.0..1.0).contains(&t) {
+        return 0.0;
+    }
+    // how much nearer than the stem the ground at this row is: 1 at the
+    // stem's foot, more below it, less up toward the horizon
+    let nearness = 1.0 - uy / NUKE_EYE_HEIGHT;
+    if nearness <= 0.05 {
+        return 0.0;
+    }
+    // across, and toward us, on the ground
+    let (x, z) = (ux / nearness, NUKE_EYE_DISTANCE - NUKE_EYE_DISTANCE / nearness);
+    let radius = 2.0 + NUKE_RING_REACH * ease_out(t);
+    let off_ring = ((x * x + z * z).sqrt() - radius) / (0.55 + 0.035 * radius);
+    let band = (-off_ring * off_ring).exp();
+    // the far side is a little dimmer than the near
+    let brightness = (0.6 + 0.3 * nearness).min(1.0);
+    (1.3 * band * brightness * (1.0 - t).powf(1.6)).min(1.0)
+}
+
 // One frame of the nuke's cloud, `since` it went off, centred on `cx` and
-// standing on line `ground`. It thins and drifts upward as it clears.
+// standing on line `ground`. It drifts upward as it clears, peeling rather
+// than fading evenly: the clearing eats into every cell alike, so thin outer
+// wisps go first and the dense column is the last to go.
 fn draw_mushroom(frame: &mut Frame, since: Duration, cx: u16, ground: u16) {
     let secs = since.as_secs_f32();
     let fade = fade_progress(secs, NUKE_FADE_START, NUKE_CLOUD);
-    let drift = 2.0 * fade;
+    let drift = 1.2 * fade;
+    let peel = 1.15 * fade.powf(0.8);
     // shrink the whole cloud to fit above the ground if the screen is short
     let top = frame.area().top();
     let room = ground.saturating_sub(top) as f32 + 1.0;
     let scale = (room / NUKE_HEIGHT).min(1.0);
-    let reach = (26.0 * scale) as u16;
+    // the ring spreads wider than the cloud, out to the screen's edges
+    let reach = frame.area().width;
     draw_smoke(frame, (cx, ground), reach, (top, ground), scale, |ux, uy| {
-        smoke(ux, uy - drift, secs) * (1.0 - fade)
+        let cloud = (smoke(ux, uy - drift, secs) - peel).max(0.0);
+        cloud.max(nuke_ring(ux, uy, secs))
+    });
+    // the base's near edge and the ring's near side come toward us, down
+    // over the rest of the screen
+    let bottom = frame.area().bottom().saturating_sub(1);
+    draw_smoke(frame, (cx, ground), reach, (ground + 1, bottom), scale, |ux, uy| {
+        let base = (smoke(ux, uy - drift, secs) - peel).max(0.0);
+        base.max(nuke_ring(ux, uy, secs))
     });
 }
 
@@ -3345,11 +3840,11 @@ fn draw_card_back(frame: &mut Frame, rect: Rect) {
     frame.render_widget(Block::bordered(), rect);
 }
 
-fn draw_card_face(frame: &mut Frame, rect: Rect, card: Card) {
+fn draw_card_face(frame: &mut Frame, rect: Rect, card: Card, gweilo: bool) {
     let rect = rect.intersection(frame.area());
     clear_rect(frame, rect);
     frame.render_widget(
-        Paragraph::new(card.face()).block(Block::bordered()),
+        Paragraph::new(card.face(gweilo)).block(Block::bordered()),
         rect,
     );
 }
@@ -3369,6 +3864,7 @@ fn draw_hand(
     y: u16,
     selected: &BTreeSet<Card>,
     cursor: Option<usize>,
+    gweilo: bool,
 ) {
     let area = frame.area();
     let stride = CARD_WIDTH - 1;
@@ -3379,7 +3875,7 @@ fn draw_hand(
 
     for i in (0..cards.len()).filter(|&i| !picked(i)) {
         let rect = card_rect(x_of(i), y).intersection(area);
-        let face = Paragraph::new(cards[i].face())
+        let face = Paragraph::new(cards[i].face(gweilo))
             .block(Block::bordered().merge_borders(MergeStrategy::Exact));
         frame.render_widget(face, rect);
     }
@@ -3390,7 +3886,10 @@ fn draw_hand(
     for i in (0..cards.len()).filter(|&i| picked(i)) {
         let rect = card_rect(x_of(i), raised_y).intersection(area);
         clear_rect(frame, rect);
-        frame.render_widget(Paragraph::new(cards[i].face()).block(Block::bordered()), rect);
+        frame.render_widget(
+            Paragraph::new(cards[i].face(gweilo)).block(Block::bordered()),
+            rect,
+        );
         // two picked neighbours share a border, so join its corners
         if i > 0 && picked(i - 1) {
             let buf = frame.buffer_mut();
@@ -3444,6 +3943,8 @@ struct Theme {
     // whether to show the lines that explain the controls; confirmations and
     // prompts that ask something are shown regardless
     hints: bool,
+    // roles and combinations in English and jokers as emoji, for fun
+    gweilo: bool,
 }
 
 // Paints every cell with the theme before rendering; widgets that don't set
@@ -3612,6 +4113,7 @@ struct Settings {
     #[serde(with = "color_setting")]
     background: Color,
     show_hints: bool,
+    gweilo_mode: bool,
 }
 
 impl Default for Settings {
@@ -3621,6 +4123,7 @@ impl Default for Settings {
             foreground: Color::Reset,
             background: Color::Reset,
             show_hints: true,
+            gweilo_mode: false,
         }
     }
 }
@@ -3631,6 +4134,7 @@ impl Settings {
             fg: self.foreground,
             bg: self.background,
             hints: self.show_hints,
+            gweilo: self.gweilo_mode,
         }
     }
 
@@ -3668,14 +4172,16 @@ enum SettingRow {
     Foreground,
     Background,
     Hints,
+    GweiloMode,
 }
 
 impl SettingRow {
-    const ALL: [SettingRow; 4] = [
+    const ALL: [SettingRow; 5] = [
         SettingRow::Name,
         SettingRow::Foreground,
         SettingRow::Background,
         SettingRow::Hints,
+        SettingRow::GweiloMode,
     ];
 
     fn label(self) -> &'static str {
@@ -3684,6 +4190,7 @@ impl SettingRow {
             SettingRow::Foreground => "Foreground",
             SettingRow::Background => "Background",
             SettingRow::Hints => "Hints",
+            SettingRow::GweiloMode => "Gweilo mode",
         }
     }
 }
@@ -3731,6 +4238,7 @@ fn run_settings(terminal: &mut DefaultTerminal, settings: &mut Settings) -> io::
                         SettingRow::Foreground => SettingsMode::PickingColor(settings.foreground),
                         SettingRow::Background => SettingsMode::PickingColor(settings.background),
                         SettingRow::Hints => SettingsMode::Toggling(settings.show_hints),
+                        SettingRow::GweiloMode => SettingsMode::Toggling(settings.gweilo_mode),
                     };
                 }
                 _ => {}
@@ -3782,20 +4290,27 @@ fn run_settings(terminal: &mut DefaultTerminal, settings: &mut Settings) -> io::
                 }
             }
             // like a colour, previewed in memory until Enter saves it
-            SettingsMode::Toggling(saved) => match key.code {
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
-                    settings.show_hints = !settings.show_hints;
+            SettingsMode::Toggling(saved) => {
+                let flag = if row == SettingRow::Hints {
+                    &mut settings.show_hints
+                } else {
+                    &mut settings.gweilo_mode
+                };
+                match key.code {
+                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
+                        *flag = !*flag;
+                    }
+                    KeyCode::Esc => {
+                        *flag = *saved;
+                        mode = SettingsMode::Browsing;
+                    }
+                    KeyCode::Enter => {
+                        mode = SettingsMode::Browsing;
+                        status = Some(settings.save_status());
+                    }
+                    _ => {}
                 }
-                KeyCode::Esc => {
-                    settings.show_hints = *saved;
-                    mode = SettingsMode::Browsing;
-                }
-                KeyCode::Enter => {
-                    mode = SettingsMode::Browsing;
-                    status = Some(settings.save_status());
-                }
-                _ => {}
-            },
+            }
         }
     }
 }
@@ -3830,6 +4345,9 @@ fn draw_settings(
                 (SettingRow::Hints, _) => {
                     if settings.show_hints { "Shown" } else { "Hidden" }.to_string()
                 }
+                (SettingRow::GweiloMode, _) => {
+                    if settings.gweilo_mode { "On" } else { "Off" }.to_string()
+                }
 
             };
             let value = match mode {
@@ -3839,7 +4357,7 @@ fn draw_settings(
                 _ => value,
             };
             let cursor = if active { ">" } else { " " };
-            format!("{cursor} {:<11} {value}", row.label())
+            format!("{cursor} {:<12} {value}", row.label())
         })
         .collect();
     frame.render_widget(
@@ -3878,8 +4396,352 @@ fn run_app(terminal: &mut DefaultTerminal) -> io::Result<()> {
                 run_settings(terminal, &mut settings)?;
                 None
             }
+            Some(MenuChoice::Playground) => {
+                run_playground(terminal, settings.theme())?;
+                None
+            }
             None => return Ok(()),
         };
+    }
+}
+
+// Hidden commands, typed after a :. Nothing advertises them. :debug on the
+// main menu opens the playground, a practice table where the others work;
+// real games ignore them, apart from pointing :debug at the menu.
+#[derive(Clone, Copy)]
+enum DebugAnim {
+    Airplane,
+    Bomb,
+    Nuke,
+}
+
+enum Command {
+    Debug,
+    Anim(DebugAnim),
+    // jump to the game-over screen, with our side winning or losing, or the
+    // landlord winning by 春天
+    Finish { win: bool, spring: bool },
+    // `force` puts the cards down over whatever is on the table
+    Play { cards: Vec<Card>, force: bool },
+    // a command that couldn't be read, and why
+    Bad(String),
+    Unknown,
+}
+
+fn parse_command(text: &str) -> Command {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    match words.as_slice() {
+        ["debug"] => Command::Debug,
+        ["win"] => Command::Finish {
+            win: true,
+            spring: false,
+        },
+        ["lose"] => Command::Finish {
+            win: false,
+            spring: false,
+        },
+        ["spring"] => Command::Finish {
+            win: false,
+            spring: true,
+        },
+        ["anim", which] => match *which {
+            "plane" => Command::Anim(DebugAnim::Airplane),
+            "bomb" => Command::Anim(DebugAnim::Bomb),
+            "nuke" => Command::Anim(DebugAnim::Nuke),
+            _ => Command::Unknown,
+        },
+        [play @ ("play" | "play!"), names @ ..] => {
+            let force = *play == "play!";
+            if names.is_empty() {
+                return Command::Bad(format!("List the cards to play, like :{play} 3S 3H"));
+            }
+            let mut cards = Vec::new();
+            for name in names {
+                let Some(card) = parse_card(name) else {
+                    return Command::Bad(format!("Couldn't read {name}"));
+                };
+                if cards.contains(&card) {
+                    return Command::Bad(format!("{name} is listed twice"));
+                }
+                cards.push(card);
+            }
+            Command::Play { cards, force }
+        }
+        _ => Command::Unknown,
+    }
+}
+
+// Reads a card written as its rank then its suit, like 10S or QH, or BJ and
+// RJ for the jokers, which have no suit. Case doesn't matter.
+fn parse_card(name: &str) -> Option<Card> {
+    let name = name.to_ascii_uppercase();
+    match name.as_str() {
+        "BJ" => return Some(Card::Joker(JokerColor::Black)),
+        "RJ" => return Some(Card::Joker(JokerColor::Red)),
+        _ => {}
+    }
+    if !name.is_ascii() || !(2..=3).contains(&name.len()) {
+        return None;
+    }
+    let (rank, suit) = name.split_at(name.len() - 1);
+    let suit = match suit {
+        "S" => Suit::Spades,
+        "H" => Suit::Hearts,
+        "D" => Suit::Diamonds,
+        "C" => Suit::Clubs,
+        _ => return None,
+    };
+    let rank = match rank {
+        "J" => Rank::Jack,
+        "Q" => Rank::Queen,
+        "K" => Rank::King,
+        "A" => Rank::Ace,
+        "2" => Rank::Two,
+        number => {
+            let n: usize = number.parse().ok()?;
+            *Rank::ALL.get(n.checked_sub(3)?).filter(|_| n <= 10)?
+        }
+    };
+    Some(Card::Standard { rank, suit })
+}
+
+enum CommandInput {
+    // the key had nothing to do with the command line
+    NotMine,
+    // the command line took the key
+    Typing,
+    Entered(String),
+}
+
+// Commands entered this run, oldest first, shared by every command line.
+static HISTORY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+// A command being typed after a :.
+struct CommandLine {
+    text: String,
+    // While cycling through history: which entry is showing, and what was
+    // being typed before, to come back to past the newest.
+    recalled: Option<(usize, String)>,
+}
+
+// A : opens the command line; then keys type into it until Enter runs what
+// was typed or Esc (or backspacing past the start) closes it. Up and Down
+// cycle through earlier commands, which can be edited before Enter.
+fn command_key(command: &mut Option<CommandLine>, code: KeyCode) -> CommandInput {
+    let Some(line) = command else {
+        if code == KeyCode::Char(':') {
+            *command = Some(CommandLine {
+                text: String::new(),
+                recalled: None,
+            });
+            return CommandInput::Typing;
+        }
+        return CommandInput::NotMine;
+    };
+    let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    match code {
+        KeyCode::Enter => {
+            let text = command.take().map(|line| line.text).unwrap_or_default();
+            // blanks and repeats of the last command aren't worth keeping
+            if !text.trim().is_empty() && history.last() != Some(&text) {
+                history.push(text.clone());
+            }
+            return CommandInput::Entered(text);
+        }
+        KeyCode::Esc => *command = None,
+        KeyCode::Up if !history.is_empty() => {
+            let (index, draft) = match line.recalled.take() {
+                Some((index, draft)) => (index.saturating_sub(1), draft),
+                None => (history.len() - 1, mem::take(&mut line.text)),
+            };
+            line.text = history[index].clone();
+            line.recalled = Some((index, draft));
+        }
+        KeyCode::Down => {
+            if let Some((index, draft)) = line.recalled.take() {
+                if index + 1 < history.len() {
+                    line.text = history[index + 1].clone();
+                    line.recalled = Some((index + 1, draft));
+                } else {
+                    line.text = draft;
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if line.text.pop().is_none() {
+                *command = None;
+            }
+        }
+        KeyCode::Char(c) => line.text.push(c),
+        _ => {}
+    }
+    CommandInput::Typing
+}
+
+fn draw_command_line(frame: &mut Frame, text: &str) {
+    let area = frame.area();
+    let line = Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1);
+    clear_rect(frame, line);
+    frame.render_widget(Paragraph::new(format!(":{text}█")), line);
+}
+
+// sample cards of the given ranks, each copy of a rank in the next suit
+fn sample_cards(ranks: &[Rank]) -> Vec<Card> {
+    let mut copies: BTreeMap<Rank, usize> = BTreeMap::new();
+    ranks
+        .iter()
+        .map(|&rank| {
+            let n = copies.entry(rank).or_default();
+            *n += 1;
+            Card::Standard {
+                rank,
+                suit: Suit::ALL[(*n - 1) % Suit::ALL.len()],
+            }
+        })
+        .collect()
+}
+
+// Puts a sample play on the playground table to go with an effect, then
+// plays it.
+fn playground_anim(view: &mut GameView, anim: DebugAnim) {
+    use Rank::*;
+    view.last_play = match anim {
+        DebugAnim::Airplane => Some(Play {
+            seat: 1,
+            cards: sample_cards(&[Three, Three, Three, Four, Four, Four]),
+            combo: Combo::Airplane { high: Four, len: 2 },
+        }),
+        DebugAnim::Bomb => Some(Play {
+            seat: 2,
+            cards: sample_cards(&[Seven, Seven, Seven, Seven]),
+            combo: Combo::Bomb(Seven),
+        }),
+        // a nuke clears the table
+        DebugAnim::Nuke => None,
+    };
+    view.debug_anim(anim);
+}
+
+// Puts `cards` on the playground table for whoever has the turn, which stays
+// with them. They're checked like any play: forced, they only need to be a
+// valid combination and go down over whatever is there; otherwise they have
+// to beat the table, as in a real game. Their effect plays as normal.
+fn playground_play(view: &mut GameView, cards: Vec<Card>, force: bool) -> Result<(), MoveError> {
+    let table = if force {
+        None
+    } else {
+        view.last_play.as_ref().map(|play| &play.combo)
+    };
+    let combo = Combo::fit(&cards, table)?;
+    let play = Play {
+        seat: view.turn,
+        cards,
+        combo,
+    };
+    match combo {
+        Combo::Bomb(_) => view.debug_anim(DebugAnim::Bomb),
+        Combo::Airplane { .. }
+        | Combo::SmallWingedAirplane { .. }
+        | Combo::LargeWingedAirplane { .. } => view.debug_anim(DebugAnim::Airplane),
+        _ => {}
+    }
+    if combo == Combo::Nuke {
+        // like a real nuke, it clears the table and is shown on its way off
+        view.last_play = None;
+        view.swept = Some(Swept {
+            play,
+            at: Instant::now(),
+            nuke: true,
+        });
+    } else {
+        view.last_play = Some(play);
+    }
+    Ok(())
+}
+
+// The playground: sample players and a real deal, already played to the
+// first turn, to try things on without anyone else. :anim plays an effect,
+// :play and :play! put cards on the table, and Esc goes back. Its lobby rules
+// have silly effects on, so every effect plays.
+fn run_playground(terminal: &mut DefaultTerminal, theme: Theme) -> io::Result<()> {
+    let game = Game::new();
+    let names = vec!["You".to_string(), "Left".to_string(), "Right".to_string()];
+    let hand = game.hands[0].cards.clone();
+    let mut view = GameView::new(0, names, game.first, hand, false, LobbySettings::DEFAULT);
+    view.crown(1, game.kitty.clone(), false);
+    let mut notice = Some(Notice::new("Playground".to_string()));
+    loop {
+        draw_themed(terminal, theme, |frame| {
+            draw_game(frame, &view, notice.as_ref().and_then(Notice::current), theme);
+            draw_sheet_or_hint(frame, &view, theme);
+            if let Some(text) = &view.command {
+                draw_command_line(frame, &text.text);
+            }
+        })?;
+        let moving = view.sweep().is_some() || view.blast().is_some() || view.flight().is_some();
+        if !event::poll(if moving { FRAME_INTERVAL } else { POLL_INTERVAL })? {
+            continue;
+        }
+        let Event::Key(key) = read_event()? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match command_key(&mut view.command, key.code) {
+            CommandInput::NotMine => {}
+            CommandInput::Typing => continue,
+            CommandInput::Entered(text) => {
+                match parse_command(&text) {
+                    // :debug leaves from the game-over screen; elsewhere
+                    // we're already here
+                    Command::Debug if view.winner.is_some() => return Ok(()),
+                    Command::Debug | Command::Unknown => {}
+                    Command::Anim(anim) => playground_anim(&mut view, anim),
+                    // We're a peasant here, under Left as landlord: winning
+                    // means a peasant (us) went out, losing or a 春天 that
+                    // Left did.
+                    Command::Finish { win, spring } => {
+                        view.winner = Some(if win { view.seat } else { 1 });
+                        view.spring = spring;
+                        view.voted = None;
+                        view.ready = 0;
+                    }
+                    Command::Play { cards, force } => {
+                        if let Err(e) = playground_play(&mut view, cards, force) {
+                            notice = Some(Notice::new(e.to_string()));
+                        }
+                    }
+                    Command::Bad(reason) => notice = Some(Notice::new(reason)),
+                }
+                continue;
+            }
+        }
+        // Esc closes the sheet first, if it's open
+        if sheet_key(&mut view, key.code) {
+            continue;
+        }
+        if key.code == KeyCode::Esc {
+            return Ok(());
+        }
+        if view.phase() == Phase::Over {
+            // The vote screen works for us, but the dummies never vote, so a
+            // yes waits forever. A no goes back to the menu, as it would close
+            // a real lobby.
+            match key.code {
+                KeyCode::Char('g' | 'G') if view.is_winner(view.seat) => {
+                    view.gloats[view.seat] = Some(Instant::now());
+                }
+                KeyCode::Char('y' | 'Y') if view.voted.is_none() => {
+                    view.voted = Some(true);
+                    view.ready = 1;
+                }
+                KeyCode::Char('n' | 'N') if view.voted.is_none() => return Ok(()),
+                _ => {}
+            }
+            continue;
+        }
+        view.hand_key(key.code);
     }
 }
 
