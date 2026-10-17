@@ -379,3 +379,24 @@ fn spring_is_only_when_no_peasant_played() {
     assert_eq!(game.winner, Some(0));
     assert!(!game.spring());
 }
+
+#[test]
+fn update_messages_follow_the_version_rule() {
+    let (major, minor, patch) = version_numbers(VERSION).unwrap();
+    // nothing to say about our own version or an older one
+    assert_eq!(update_message(VERSION), None);
+    if patch > 0 {
+        assert_eq!(update_message(&format!("{major}.{minor}.{}", patch - 1)), None);
+    }
+    let newer_patch = format!("{major}.{minor}.{}", patch + 1);
+    assert_eq!(
+        update_message(&newer_patch),
+        Some(format!("update available: v{newer_patch}"))
+    );
+    let newer_minor = format!("{major}.{}.0", minor + 1);
+    assert_eq!(
+        update_message(&newer_minor),
+        Some(format!("update required: v{newer_minor}"))
+    );
+    assert_eq!(update_message("not a version"), None);
+}

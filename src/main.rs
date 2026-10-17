@@ -20,6 +20,7 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::str;
 use std::sync::Mutex;
+use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -84,51 +85,89 @@ const BOMB_GROW: f32 = 0.4;
 const BOMB_FADE_START: f32 = 0.7;
 // the shockwave's full radius, in lines; the long beams reach a third further
 const BOMB_RADIUS: f32 = 8.0;
-// An airplane flies across above the table, right to left, over AIRPLANE_FLIGHT,
-// rolling back and forth AIRPLANE_ROLLS times; the played cards appear on the
-// table once its nose passes the middle of the screen.
-const AIRPLANE_FLIGHT: Duration = Duration::from_millis(1200);
-const AIRPLANE_ROLLS: f32 = 2.0;
-// Seen side-on with the nose to the left, at roll -1, -0.5, 0, 0.5 and 1.
-// Level wings are edge-on; rolling, they show above and below the fuselage,
-// the near wing as || and the far one, behind it, as ::. Spaces are see-through.
-const AIRPLANE: [[&str; 5]; 5] = [
-    [
-        "     ::     ",
-        "     ::     ",
-        " <===##===<|",
-        "     ||     ",
-        "     ||     ",
-    ],
-    [
-        "            ",
-        "     ::     ",
-        " <===##===<|",
-        "     ||     ",
-        "            ",
-    ],
-    [
-        "            ",
-        "            ",
-        " <===##===<|",
-        "            ",
-        "            ",
-    ],
-    [
-        "            ",
-        "     ||     ",
-        " <===##===<|",
-        "     ::     ",
-        "            ",
-    ],
-    [
-        "     ||     ",
-        "     ||     ",
-        " <===##===<|",
-        "     ::     ",
-        "     ::     ",
-    ],
+// Airplanes fly across above the table, right to left, and the played cards
+// appear on it once a plane's nose passes the middle of the screen. Each kind
+// of airplane gets its own plane, faster as they go up: a biplane for a
+// plain airplane, an airliner trailing a little smoke for a small-winged one,
+// and a jet with a sonic boom for a large-winged one. All of them are seen
+// side-on with the nose to the left, the fuselage on the middle line, and
+// spaces see-through.
+const BIPLANE_FLIGHT: Duration = Duration::from_millis(1400);
+const BIPLANE: [&str; 5] = [
+    "   ______      ",
+    "    |   |      ",
+    " *=[o]===---<| ",
+    "   _|___|_     ",
+    "     o  o      ",
 ];
+const AIRLINER_FLIGHT: Duration = Duration::from_millis(950);
+// how long the airliner's smoke lingers behind it, in seconds
+const AIRLINER_SMOKE: f32 = 0.9;
+const AIRLINER: [&str; 5] = [
+    "              __  ",
+    "  ___________/  | ",
+    " (_o_o_o_o_o____|>",
+    "      \\___\\       ",
+    "                  ",
+];
+// Large-winged airplanes get a jet instead of the propeller plane: twice as
+// fast, too quick to roll, and breaking the sound barrier as its nose
+// crosses the middle of the screen. The boom hides the cards there until it
+// has thinned for BOOM_REVEAL, then peels away over SONIC_BOOM. In seconds:
+const JET_FLIGHT: Duration = Duration::from_millis(600);
+const SONIC_BOOM: f32 = 1.0;
+const BOOM_REVEAL: f32 = 0.35;
+// how far the shock ring spreads, in lines
+const BOOM_REACH: f32 = 11.0;
+// A delta-wing jet seen from above, nose to the left, wings swept back.
+const JET: [&str; 5] = [
+    "        /|     ",
+    "       / |     ",
+    " <====/__|===<|",
+    "       \\ |     ",
+    "        \\|     ",
+];
+
+#[derive(Clone, Copy, PartialEq)]
+enum Plane {
+    Biplane,
+    Airliner,
+    Jet,
+}
+
+impl Plane {
+    fn flight(self) -> Duration {
+        match self {
+            Plane::Biplane => BIPLANE_FLIGHT,
+            Plane::Airliner => AIRLINER_FLIGHT,
+            Plane::Jet => JET_FLIGHT,
+        }
+    }
+
+    // how long the flypast goes on, counting whatever it leaves behind; the
+    // jet's boom starts during the flight, so this outlasts it
+    fn lasts(self) -> Duration {
+        self.flight()
+            + match self {
+                Plane::Biplane => Duration::ZERO,
+                Plane::Airliner => Duration::from_secs_f32(AIRLINER_SMOKE),
+                Plane::Jet => Duration::from_secs_f32(SONIC_BOOM),
+            }
+    }
+
+    fn art(self) -> &'static [&'static str; 5] {
+        match self {
+            Plane::Biplane => &BIPLANE,
+            Plane::Airliner => &AIRLINER,
+            Plane::Jet => &JET,
+        }
+    }
+
+    fn width(self) -> usize {
+        self.art()[0].len()
+    }
+}
+
 // smoke from thin to thick; a blank cell lets the table show through
 const SMOKE: [&str; 5] = [" ", "░", "▒", "▓", "█"];
 // Ordered dithering: each cell's offset nudges where it steps between shades,
@@ -585,12 +624,14 @@ fn run_menu(
     terminal: &mut DefaultTerminal,
     theme: Theme,
     notice: Option<&str>,
+    show_update: bool,
 ) -> io::Result<Option<MenuChoice>> {
     let mut confirm_quit = false;
     let mut command: Option<CommandLine> = None;
     loop {
+        let update = show_update.then(found_update).flatten();
         draw_themed(terminal, theme, |frame| {
-            draw_menu(frame, notice);
+            draw_menu(frame, notice, update.as_deref());
             if confirm_quit {
                 draw_quit_prompt(frame, "Press [Esc] again to quit");
             }
@@ -598,6 +639,10 @@ fn run_menu(
                 draw_command_line(frame, &text.text);
             }
         })?;
+        // poll, so the update check's answer shows up without a keypress
+        if !event::poll(POLL_INTERVAL)? {
+            continue;
+        }
         if let Event::Key(key) = read_event()? {
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -626,17 +671,28 @@ fn run_menu(
 }
 
 // 春天, shown when the landlord wins before either peasant has played, drawn
-// like the title but from the font at 16 pixels a character.
-const SPRING: [&str; 8] = [
-    "      ▄▄            ▄▄▄▄▄▄▄▄▄▄  ",
-    " ▀▀▀▀▀█▀▀▀▀▀▀       ▀▀▀▀██▀▀▀▀  ",
-    "  ▀▀▀██▀▀▀▀▀            ██      ",
-    " ██▄███▄▄▄▄██     ▀▀▀▀▀███▀▀▀▀▀▀",
-    " ▄▄██▄▄▄▄██▄▄▄         ██▀█     ",
-    "▀▀▀██▄▄▄▄▄█ ▀▀        ██  ▀█▄   ",
-    "   ██▄▄▄▄▄█       ▄▄██▀     ▀██ ",
-    "   ▀▀▀▀▀▀▀▀        ▀            ",
+// like the title but from the font at 24 pixels a character.
+const SPRING: [&str; 12] = [
+    "          ▄▄▄                                    ",
+    "  ▄▄▄▄▄▄▄▄██▄▄▄▄▄▄▄▄           ████████████████  ",
+    "  ▀▀▀▀▀▀▀██▀▀▀▀▀▀▀▀▀                  ██         ",
+    "   ████████████████                   ██         ",
+    "        ██                   ▄▄▄▄▄▄▄▄▄██▄▄▄▄▄▄▄▄▄",
+    " █▀▀▀▀███▀▀▀▀▀██▀▀▀▀█        ▀▀▀▀▀▀▀▀████▀▀▀▀▀▀▀▀",
+    "    ▄███▄▄▄▄▄▄███▄▄                 ▄██▀█▄       ",
+    "▄▄█████▀▀▀▀▀▀▀▀██▀███▀             ▄██▀ ██▄      ",
+    " ▀▀  ███▄▄▄▄▄▄▄██                 ▄██▀   ▀██▄    ",
+    "     ██        ██             ▄▄███▀       ▀███▄▄",
+    "     ████████████            ▀█▀▀            ▀▀▀ ",
+    "     ▀▀        ▀▀                                ",
 ];
+
+// Petals drift down the 春天 screen from the top left to the bottom right,
+// each crossing in about PETAL_FALL seconds before starting over somewhere
+// new. They flutter by changing shape as they go.
+const PETALS: usize = 36;
+const PETAL_FALL: f32 = 5.0;
+const PETAL_SHAPES: [char; 4] = ['*', '\'', '`', ','];
 
 // 鬥地主 for the title, drawn from the STHeiti Medium font at 22 pixels a
 // character. Each cell is two pixels stacked, using half blocks, so the
@@ -656,7 +712,7 @@ const TITLE: [&str; 11] = [
     "▀▀            ▀▀                 ▀▀▀▀▀▀▀                            ",
 ];
 
-fn draw_menu(frame: &mut Frame, notice: Option<&str>) {
+fn draw_menu(frame: &mut Frame, notice: Option<&str>, update: Option<&str>) {
     let full = frame.area();
     // the title, a gap, three buttons, and a line for any notice: 24 lines,
     // which is the smallest the screen gets
@@ -689,13 +745,79 @@ fn draw_menu(frame: &mut Frame, notice: Option<&str>) {
     }
 
     // bottom-left, clear of the quit prompt in the bottom-right corner
+    let version = match update {
+        Some(update) => format!("v{VERSION} · {update}"),
+        None => format!("v{VERSION}"),
+    };
     frame.render_widget(
-        Paragraph::new(format!("v{VERSION}")),
+        Paragraph::new(version),
         Rect::new(full.x + 1, full.bottom().saturating_sub(1), full.width, 1).intersection(full),
     );
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Where new versions are published, as "owner/repo" on GitHub; the update
+// check looks at its latest release. While it's empty, there's no check.
+const UPDATE_REPO: &str = "ywbrian/DouDiZhu";
+
+// what the update check found worth saying, once it has answered
+static UPDATE: Mutex<Option<String>> = Mutex::new(None);
+static UPDATE_CHECKED: AtomicBool = AtomicBool::new(false);
+
+fn found_update() -> Option<String> {
+    UPDATE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+// Asks GitHub for the latest release in the background, once per run, so it
+// never holds anything up. If it's newer than us, the menu says so. Being
+// offline, or there being no release yet, just means nothing is said.
+fn check_for_update() {
+    if UPDATE_REPO.is_empty() || UPDATE_CHECKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    thread::spawn(|| {
+        if let Some(message) = latest_release().and_then(|latest| update_message(&latest)) {
+            *UPDATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+        }
+    });
+}
+
+#[derive(Deserialize)]
+struct Release {
+    tag_name: String,
+}
+
+// the latest release's version, without the tag's leading "v"
+fn latest_release() -> Option<String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(5)))
+        .build()
+        .new_agent();
+    let url = format!("https://api.github.com/repos/{UPDATE_REPO}/releases/latest");
+    // GitHub's API turns away requests that don't say who they're from
+    let mut response = agent.get(&url).header("User-Agent", "DouDiZhu").call().ok()?;
+    let release: Release = response.body_mut().read_json().ok()?;
+    Some(release.tag_name.trim_start_matches('v').to_string())
+}
+
+fn version_numbers(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.split('.').map(|part| part.parse().ok());
+    Some((parts.next()??, parts.next()??, parts.next()??))
+}
+
+// What to say about `latest`, if it's newer than us: a required update if
+// lobbies won't match across the versions, otherwise an available one.
+fn update_message(latest: &str) -> Option<String> {
+    if version_numbers(latest)? <= version_numbers(VERSION)? {
+        return None;
+    }
+    Some(if compatible(latest) {
+        format!("update available: v{latest}")
+    } else {
+        format!("update required: v{latest}")
+    })
+}
 
 // Whether a host on `version` can play with us: the same major and minor
 // version. Patch releases don't change how games talk to each other.
@@ -1403,7 +1525,7 @@ impl HostTable {
             });
             self.view.winner = Some(winner);
             self.view.wins = wins;
-            self.view.spring = spring;
+            self.view.spring = spring.then(Instant::now);
         }
         Ok(text)
     }
@@ -2136,7 +2258,7 @@ fn run_joined_game(
                 } => {
                     view.winner = Some(winner);
                     view.wins = wins;
-                    view.spring = spring;
+                    view.spring = spring.then(Instant::now);
                 }
                 Message::Ready { count } => view.ready = count,
                 Message::Gloated { seat } => view.gloats[seat] = Some(Instant::now()),
@@ -2369,11 +2491,11 @@ struct GameView {
     // when the latest bomb went off, for its blast
     bombed: Option<Instant>,
     // when the latest airplane was played, for its flypast
-    flown: Option<Instant>,
+    flown: Option<(Instant, Plane)>,
     // whoever shed their whole hand, once someone has
     winner: Option<usize>,
-    // whether it was a 春天, which the game-over screen celebrates
-    spring: bool,
+    // when the game-over screen started, if it was a 春天, which it celebrates
+    spring: Option<Instant>,
     // our answer to playing again, and how many have said yes so far
     voted: Option<bool>,
     ready: usize,
@@ -2494,7 +2616,7 @@ impl GameView {
             bombed: None,
             flown: None,
             winner: None,
-            spring: false,
+            spring: None,
             voted: None,
             ready: 0,
             move_timer: rules.move_timer.map(Duration::from_secs),
@@ -2573,16 +2695,10 @@ impl GameView {
                 nuke: true,
             });
         }
-        if last_play.as_ref().is_some_and(|play| {
-            play.seat == seat
-                && matches!(
-                    play.combo,
-                    Combo::Airplane { .. }
-                        | Combo::SmallWingedAirplane { .. }
-                        | Combo::LargeWingedAirplane { .. }
-                )
-        }) {
-            self.flown = Some(Instant::now());
+        if let Some(play) = last_play.as_ref().filter(|play| play.seat == seat)
+            && let Some(plane) = plane_for(play.combo)
+        {
+            self.flown = Some((Instant::now(), plane));
         }
         self.last_play = last_play;
         let who = if seat == self.seat {
@@ -2620,19 +2736,22 @@ impl GameView {
             .is_some_and(|since| since.as_secs_f32() < BOMB_FADE_START)
     }
 
-    // How far the latest airplane's flypast has got, 0 to 1, while it's going.
-    // There's no flypast with silly effects off.
-    fn flight(&self) -> Option<f32> {
-        let since = self.flown.filter(|_| self.silly_effects)?.elapsed();
-        let t = since.as_secs_f32() / AIRPLANE_FLIGHT.as_secs_f32();
-        (t < 1.0).then_some(t)
+    // How long since the latest airplane's flypast started, and which plane,
+    // while it or its sonic boom is still going. There's no flypast with silly
+    // effects off.
+    fn flypast(&self) -> Option<(Duration, Plane)> {
+        let (at, plane) = self.flown.filter(|_| self.silly_effects)?;
+        let since = at.elapsed();
+        (since < plane.lasts()).then_some((since, plane))
     }
 
     // Starts an effect on this screen only, for the playground.
     fn debug_anim(&mut self, anim: DebugAnim) {
         let now = Instant::now();
         match anim {
-            DebugAnim::Airplane => self.flown = Some(now),
+            DebugAnim::Biplane => self.flown = Some((now, Plane::Biplane)),
+            DebugAnim::Airliner => self.flown = Some((now, Plane::Airliner)),
+            DebugAnim::Jet => self.flown = Some((now, Plane::Jet)),
             DebugAnim::Bomb => self.bombed = Some(now),
             DebugAnim::Nuke => {
                 self.swept = Some(Swept {
@@ -3110,7 +3229,8 @@ fn game_frame(
     let moving =
         matches!(view.phase(), Phase::Dealing | Phase::Crowning) || view.sweep().is_some()
         || view.blast().is_some()
-        || view.flight().is_some();
+        || view.flypast().is_some()
+        || view.spring.is_some();
     let wait = if moving { FRAME_INTERVAL } else { POLL_INTERVAL };
     if !event::poll(wait)? {
         return Ok(None);
@@ -3240,15 +3360,27 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, theme: Th
     let kitty_width = KITTY_SIZE as u16 * (CARD_WIDTH + 1) - 1;
     let kitty_x = |i: usize| cx.saturating_sub(kitty_width / 2) + i as u16 * (CARD_WIDTH + 1);
     let kitty_y = cy.saturating_sub(1);
-    // The flypast's left edge: from just past the right of the screen to just
-    // past the left. Cards it brings appear once its nose (one column in)
-    // passes the middle.
-    let plane_x = view.flight().map(|t| {
-        let width = AIRPLANE[0][0].len() as f32;
+    // The flypast: its plane flies from just past the right of the screen to
+    // just past the left. Cards it brings appear once its nose (one column in)
+    // passes the middle, which is also where a jet's sonic boom goes off.
+    let flypast = view.flypast().map(|(since, plane)| {
         let start = area.right() as f32;
-        let end = area.x as f32 - width;
-        (start + (end - start) * t).round() as i32
+        let end = area.x as f32 - plane.width() as f32;
+        let flight = plane.flight().as_secs_f32();
+        let t = since.as_secs_f32() / flight;
+        let cross_t = ((start - (cx as f32 - 1.0)) / (start - end)).clamp(0.0, 1.0);
+        Flypast {
+            plane,
+            t,
+            start,
+            end,
+            x: (t < 1.0).then(|| (start + (end - start) * t).round() as i32),
+            crossed: (t >= cross_t).then(|| since.as_secs_f32() - cross_t * flight),
+        }
     });
+    // the line the plane's fuselage flies along, with its lower wing tip just
+    // above the line naming the table's player
+    let plane_top = kitty_y as i32 - 1 - BIPLANE.len() as i32;
 
     if let Some(msg) = notice {
         frame.render_widget(
@@ -3343,7 +3475,7 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, theme: Th
         // the table only ever shows the latest combination
         if let Some(play) = &view.last_play
             && !view.blast_covers_table()
-            && !plane_x.is_some_and(|x| x + 1 > cx as i32)
+            && !flypast.as_ref().is_some_and(Flypast::hides_table)
         {
             draw_play(frame, view, play, kitty_y, gweilo);
         }
@@ -3425,14 +3557,34 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, theme: Th
         let centre = kitty_y + CARD_HEIGHT / 2;
         draw_bomb_blast(frame, since, cx, centre, prompt_y.saturating_sub(1));
     }
-    if let (Some(x), Some(t)) = (plane_x, view.flight()) {
-        // rolling back and forth, snapped to the nearest frame
-        let roll = (t * AIRPLANE_ROLLS * 2.0 * PI).sin();
-        let frame_index = ((roll + 1.0) * 2.0).round() as usize;
-        // the lower wing tip clears the line naming the table's player, just
-        // above the cards
-        let top = kitty_y as i32 - 1 - AIRPLANE[0].len() as i32;
-        draw_art(frame, &AIRPLANE[frame_index], x, top);
+    if let Some(flypast) = &flypast {
+        if flypast.plane == Plane::Jet
+            && let Some(since) = flypast.crossed
+            && since < SONIC_BOOM
+        {
+            // around where the jet crossed, kept clear of our prompt and hand
+            let centre = (plane_top + 2).max(0) as u16;
+            let floor = prompt_y.saturating_sub(1);
+            draw_smoke(frame, (cx, centre), area.width, (area.top(), floor), 1.0, |ux, uy| {
+                sonic_boom(ux, uy, since)
+            });
+        }
+        if flypast.plane == Plane::Airliner {
+            let line = (plane_top + 2).max(0) as u16;
+            let since = flypast.t * AIRLINER_FLIGHT.as_secs_f32();
+            let (start, end) = (flypast.start, flypast.end);
+            let width = Plane::Airliner.width() as f32;
+            draw_smoke(frame, (cx, line), area.width, (line.saturating_sub(3), line + 3), 1.0, |ux, uy| {
+                // when the tail passed this column, and how long ago
+                let column = cx as f32 + 2.0 * ux;
+                let passed = (start + width - column) / (start - end) * AIRLINER_FLIGHT.as_secs_f32();
+                airliner_smoke(uy, since - passed)
+            });
+        }
+        // drawn over its smoke, so the plane leads it
+        if let Some(x) = flypast.x {
+            draw_art(frame, flypast.plane.art(), x, plane_top);
+        }
     }
 
     // the kitty flips face up all at once, then slides to the landlord together
@@ -3449,11 +3601,13 @@ fn draw_game(frame: &mut Frame, view: &GameView, notice: Option<&str>, theme: Th
     }
 
     if let Some((headline, won)) = view.result(gweilo) {
-        // a 春天 gets its characters above the box, the pair centred together
-        let art_height = if view.spring { SPRING.len() as u16 + 1 } else { 0 };
+        // A 春天 gets its characters above the box, the pair centred together,
+        // with petals falling behind them both.
+        let art_height = if view.spring.is_some() { SPRING.len() as u16 + 1 } else { 0 };
         let column = area.centered(Constraint::Length(46), Constraint::Length(art_height + 8));
         let rect = Rect::new(column.x, column.y + art_height, column.width, 8);
-        if view.spring {
+        if let Some(at) = view.spring {
+            draw_petals(frame, at.elapsed());
             let width = SPRING[0].chars().count() as u16;
             let x = area.x + area.width.saturating_sub(width) / 2;
             clear_rect(frame, Rect::new(x, column.y, width, SPRING.len() as u16));
@@ -3815,6 +3969,116 @@ fn draw_art(frame: &mut Frame, art: &[&str], x: i32, y: i32) {
     }
 }
 
+// Where an airplane's flypast has got.
+struct Flypast {
+    plane: Plane,
+    // how far across, 0 to 1, going past 1 while its smoke or boom lingers
+    t: f32,
+    // where its left edge starts and ends up, in columns
+    start: f32,
+    end: f32,
+    // the plane's left edge, while it's still on screen
+    x: Option<i32>,
+    // seconds since its nose crossed the middle, once it has
+    crossed: Option<f32>,
+}
+
+impl Flypast {
+    // Cards wait for the plane to cross the middle, and for a jet's boom to
+    // thin enough to see through.
+    fn hides_table(&self) -> bool {
+        match self.crossed {
+            None => true,
+            Some(since) => self.plane == Plane::Jet && since < BOOM_REVEAL,
+        }
+    }
+}
+
+// which plane flies past for an airplane combination, if it is one
+fn plane_for(combo: Combo) -> Option<Plane> {
+    match combo {
+        Combo::Airplane { .. } => Some(Plane::Biplane),
+        Combo::SmallWingedAirplane { .. } => Some(Plane::Airliner),
+        Combo::LargeWingedAirplane { .. } => Some(Plane::Jet),
+        _ => None,
+    }
+}
+
+// How thick the airliner's smoke is, 0 to 1, `uy` lines above or below its
+// path, `age` seconds after its tail went by: a thin trail that spreads into
+// a small blanket and fades.
+fn airliner_smoke(uy: f32, age: f32) -> f32 {
+    if !(0.0..AIRLINER_SMOKE).contains(&age) {
+        return 0.0;
+    }
+    let spread = 0.45 + 1.4 * age;
+    0.8 * (-(uy / spread).powi(2)).exp() * (1.0 - age / AIRLINER_SMOKE)
+}
+
+// How thick a jet's sonic boom is, 0 to 1, at a point `ux` across and `uy`
+// up from where it crossed the middle, `secs` after: a shock ring racing out,
+// and a cloud of vapour left behind the jet, which peels away.
+fn sonic_boom(ux: f32, uy: f32, secs: f32) -> f32 {
+    let t = secs / SONIC_BOOM;
+    if !(0.0..1.0).contains(&t) {
+        return 0.0;
+    }
+    let radius = 1.0 + BOOM_REACH * ease_out(t);
+    let distance = (ux * ux + uy * uy).sqrt();
+    let ring = (-((distance - radius) / 0.7).powi(2)).exp() * (1.0 - t);
+    // the jet went left, so the vapour trails off to the right
+    let (vx, vy) = ((ux - 0.5 * radius) / (1.5 + 0.9 * radius), uy / (1.0 + 0.35 * radius));
+    let vapour = 1.6 * (1.0 - (vx * vx + vy * vy).sqrt());
+    let body = if vapour > 0.0 {
+        vapour + 0.1 * (ux * 1.4 + secs * 6.0).sin() * (uy * 1.9 - secs * 4.0).cos()
+    } else {
+        0.0
+    };
+    let peel = 1.3 * t.powf(0.9);
+    (body - peel).max(ring).clamp(0.0, 1.0)
+}
+
+// a repeatable stand-in for a random number from 0 to 1, for property `j`
+// of petal `i`
+fn petal_noise(i: usize, j: usize) -> f32 {
+    let x = (i as f32 * 12.9898 + j as f32 * 78.233).sin() * 43758.547;
+    x - x.floor()
+}
+
+// The petals, `since` the 春天 screen opened. Each one falls on its own loop,
+// the first time after its own delay so they start one by one, and each
+// time round from a new spot in the top left.
+fn draw_petals(frame: &mut Frame, since: Duration) {
+    let area = frame.area();
+    let (width, height) = (area.width as f32, area.height as f32);
+    let secs = since.as_secs_f32();
+    let buf = frame.buffer_mut();
+    for petal in 0..PETALS {
+        let delay = petal_noise(petal, 0) * PETAL_FALL;
+        if secs < delay {
+            continue;
+        }
+        let round = ((secs - delay) / PETAL_FALL) as usize;
+        let life = (secs - delay) % PETAL_FALL;
+        let progress = life / PETAL_FALL;
+        // a different petal each time round, as far as anyone can tell
+        let id = petal + round * PETALS;
+        let x0 = area.x as f32 + petal_noise(id, 1) * width * 0.45 - width * 0.1;
+        let y0 = area.y as f32 + petal_noise(id, 2) * height * 0.3 - 2.0;
+        let speed = 0.75 + 0.5 * petal_noise(id, 3);
+        let sway = 2.0 * (life * 2.2 + petal as f32).sin();
+        let x = x0 + progress * width * 0.9 * speed + sway;
+        let y = y0 + progress * height * 1.1 * speed;
+        if x < area.left() as f32 || y < area.top() as f32 {
+            continue;
+        }
+        let shape = PETAL_SHAPES[((life * 5.0) as usize + petal) % PETAL_SHAPES.len()];
+        if let Some(cell) = buf.cell_mut((x as u16, y as u16)) {
+            cell.set_char(shape);
+        }
+    }
+}
+
 fn card_rect(x: u16, y: u16) -> Rect {
     Rect::new(x, y, CARD_WIDTH, CARD_HEIGHT)
 }
@@ -4114,6 +4378,7 @@ struct Settings {
     background: Color,
     show_hints: bool,
     gweilo_mode: bool,
+    check_updates: bool,
 }
 
 impl Default for Settings {
@@ -4124,6 +4389,7 @@ impl Default for Settings {
             background: Color::Reset,
             show_hints: true,
             gweilo_mode: false,
+            check_updates: true,
         }
     }
 }
@@ -4173,15 +4439,17 @@ enum SettingRow {
     Background,
     Hints,
     GweiloMode,
+    UpdateCheck,
 }
 
 impl SettingRow {
-    const ALL: [SettingRow; 5] = [
+    const ALL: [SettingRow; 6] = [
         SettingRow::Name,
         SettingRow::Foreground,
         SettingRow::Background,
         SettingRow::Hints,
         SettingRow::GweiloMode,
+        SettingRow::UpdateCheck,
     ];
 
     fn label(self) -> &'static str {
@@ -4191,6 +4459,7 @@ impl SettingRow {
             SettingRow::Background => "Background",
             SettingRow::Hints => "Hints",
             SettingRow::GweiloMode => "Gweilo mode",
+            SettingRow::UpdateCheck => "Update check",
         }
     }
 }
@@ -4239,6 +4508,7 @@ fn run_settings(terminal: &mut DefaultTerminal, settings: &mut Settings) -> io::
                         SettingRow::Background => SettingsMode::PickingColor(settings.background),
                         SettingRow::Hints => SettingsMode::Toggling(settings.show_hints),
                         SettingRow::GweiloMode => SettingsMode::Toggling(settings.gweilo_mode),
+                        SettingRow::UpdateCheck => SettingsMode::Toggling(settings.check_updates),
                     };
                 }
                 _ => {}
@@ -4291,10 +4561,10 @@ fn run_settings(terminal: &mut DefaultTerminal, settings: &mut Settings) -> io::
             }
             // like a colour, previewed in memory until Enter saves it
             SettingsMode::Toggling(saved) => {
-                let flag = if row == SettingRow::Hints {
-                    &mut settings.show_hints
-                } else {
-                    &mut settings.gweilo_mode
+                let flag = match row {
+                    SettingRow::Hints => &mut settings.show_hints,
+                    SettingRow::GweiloMode => &mut settings.gweilo_mode,
+                    _ => &mut settings.check_updates,
                 };
                 match key.code {
                     KeyCode::Left | KeyCode::Char('h') | KeyCode::Right | KeyCode::Char('l') => {
@@ -4345,6 +4615,9 @@ fn draw_settings(
                 (SettingRow::Hints, _) => {
                     if settings.show_hints { "Shown" } else { "Hidden" }.to_string()
                 }
+                (SettingRow::UpdateCheck, _) => {
+                    if settings.check_updates { "On" } else { "Off" }.to_string()
+                }
                 (SettingRow::GweiloMode, _) => {
                     if settings.gweilo_mode { "On" } else { "Off" }.to_string()
                 }
@@ -4389,7 +4662,17 @@ fn run_app(terminal: &mut DefaultTerminal) -> io::Result<()> {
     // why we've come back to the menu, shown until the player picks something
     let mut notice: Option<String> = None;
     loop {
-        notice = match run_menu(terminal, settings.theme(), notice.as_deref())? {
+        // at startup, or once it's turned on in settings
+        if settings.check_updates {
+            check_for_update();
+        }
+        let choice = run_menu(
+            terminal,
+            settings.theme(),
+            notice.as_deref(),
+            settings.check_updates,
+        )?;
+        notice = match choice {
             Some(MenuChoice::Host) => run_host(terminal, &settings)?,
             Some(MenuChoice::Join) => run_join(terminal, &settings)?,
             Some(MenuChoice::Settings) => {
@@ -4410,7 +4693,9 @@ fn run_app(terminal: &mut DefaultTerminal) -> io::Result<()> {
 // real games ignore them, apart from pointing :debug at the menu.
 #[derive(Clone, Copy)]
 enum DebugAnim {
-    Airplane,
+    Biplane,
+    Airliner,
+    Jet,
     Bomb,
     Nuke,
 }
@@ -4445,7 +4730,9 @@ fn parse_command(text: &str) -> Command {
             spring: true,
         },
         ["anim", which] => match *which {
-            "plane" => Command::Anim(DebugAnim::Airplane),
+            "biplane" => Command::Anim(DebugAnim::Biplane),
+            "airliner" => Command::Anim(DebugAnim::Airliner),
+            "jet" => Command::Anim(DebugAnim::Jet),
             "bomb" => Command::Anim(DebugAnim::Bomb),
             "nuke" => Command::Anim(DebugAnim::Nuke),
             _ => Command::Unknown,
@@ -4606,10 +4893,20 @@ fn sample_cards(ranks: &[Rank]) -> Vec<Card> {
 fn playground_anim(view: &mut GameView, anim: DebugAnim) {
     use Rank::*;
     view.last_play = match anim {
-        DebugAnim::Airplane => Some(Play {
+        DebugAnim::Biplane => Some(Play {
             seat: 1,
             cards: sample_cards(&[Three, Three, Three, Four, Four, Four]),
             combo: Combo::Airplane { high: Four, len: 2 },
+        }),
+        DebugAnim::Airliner => Some(Play {
+            seat: 1,
+            cards: sample_cards(&[Three, Three, Three, Four, Four, Four, Seven, Nine]),
+            combo: Combo::SmallWingedAirplane { high: Four, len: 2 },
+        }),
+        DebugAnim::Jet => Some(Play {
+            seat: 1,
+            cards: sample_cards(&[Three, Three, Three, Four, Four, Four, Seven, Seven, Nine, Nine]),
+            combo: Combo::LargeWingedAirplane { high: Four, len: 2 },
         }),
         DebugAnim::Bomb => Some(Play {
             seat: 2,
@@ -4640,9 +4937,9 @@ fn playground_play(view: &mut GameView, cards: Vec<Card>, force: bool) -> Result
     };
     match combo {
         Combo::Bomb(_) => view.debug_anim(DebugAnim::Bomb),
-        Combo::Airplane { .. }
-        | Combo::SmallWingedAirplane { .. }
-        | Combo::LargeWingedAirplane { .. } => view.debug_anim(DebugAnim::Airplane),
+        Combo::Airplane { .. } => view.debug_anim(DebugAnim::Biplane),
+        Combo::SmallWingedAirplane { .. } => view.debug_anim(DebugAnim::Airliner),
+        Combo::LargeWingedAirplane { .. } => view.debug_anim(DebugAnim::Jet),
         _ => {}
     }
     if combo == Combo::Nuke {
@@ -4678,7 +4975,10 @@ fn run_playground(terminal: &mut DefaultTerminal, theme: Theme) -> io::Result<()
                 draw_command_line(frame, &text.text);
             }
         })?;
-        let moving = view.sweep().is_some() || view.blast().is_some() || view.flight().is_some();
+        let moving = view.sweep().is_some()
+            || view.blast().is_some()
+            || view.flypast().is_some()
+            || view.spring.is_some();
         if !event::poll(if moving { FRAME_INTERVAL } else { POLL_INTERVAL })? {
             continue;
         }
@@ -4703,7 +5003,7 @@ fn run_playground(terminal: &mut DefaultTerminal, theme: Theme) -> io::Result<()
                     // Left did.
                     Command::Finish { win, spring } => {
                         view.winner = Some(if win { view.seat } else { 1 });
-                        view.spring = spring;
+                        view.spring = spring.then(Instant::now);
                         view.voted = None;
                         view.ready = 0;
                     }
